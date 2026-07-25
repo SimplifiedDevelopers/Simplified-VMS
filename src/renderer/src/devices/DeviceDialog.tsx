@@ -30,6 +30,7 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
   const [name, setName] = useState(initial?.name ?? '');
   const [host, setHost] = useState(initial?.host ?? '');
   const [port, setPort] = useState(String(initial?.port ?? DEFAULT_PORTS[vendor]));
+  const [httpPort, setHttpPort] = useState(String(initial?.httpPort ?? 80));
   const [username, setUsername] = useState(initial?.username ?? 'admin');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -52,6 +53,7 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
         vendor,
         host: host.trim(),
         port: Number(port),
+        httpPort: Number(httpPort),
         username,
         password,
       });
@@ -70,7 +72,15 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
     }
     setBusy(true);
     try {
-      await onSave({ name: name.trim(), vendor, host: host.trim(), port: Number(port), username, password });
+      await onSave({
+        name: name.trim(),
+        vendor,
+        host: host.trim(),
+        port: Number(port),
+        httpPort: Number(httpPort),
+        username,
+        password,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -127,8 +137,11 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
           <Field label="IP/Domain">
             <input value={host} onChange={(e) => setHost(e.target.value)} style={inputStyle} />
           </Field>
-          <Field label="Port">
+          <Field label="Service Port">
             <input value={port} onChange={(e) => setPort(e.target.value)} style={inputStyle} />
+          </Field>
+          <Field label="HTTP Port (for Open in Browser)">
+            <input value={httpPort} onChange={(e) => setHttpPort(e.target.value)} style={inputStyle} />
           </Field>
           <Field label="Username">
             <input value={username} onChange={(e) => setUsername(e.target.value)} style={inputStyle} />

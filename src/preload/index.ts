@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
+  AppSettings,
   AuthStatus,
   ChannelInfo,
   ConnectionTestResult,
@@ -76,7 +77,17 @@ const liveView = {
   },
 };
 
-const api = { auth, prefs, devices, liveView };
+const settings = {
+  get: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
+  set: (partial: Partial<AppSettings>): Promise<AppSettings> => ipcRenderer.invoke('settings:set', partial),
+};
+
+const system = {
+  restart: (): Promise<void> => ipcRenderer.invoke('system:restart'),
+  openInBrowser: (host: string, port: number): Promise<void> => ipcRenderer.invoke('system:openInBrowser', host, port),
+};
+
+const api = { auth, prefs, devices, liveView, settings, system };
 export type PreloadApi = typeof api;
 
 contextBridge.exposeInMainWorld('ssmVms', api);

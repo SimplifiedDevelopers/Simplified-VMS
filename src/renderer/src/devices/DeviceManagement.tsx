@@ -98,6 +98,9 @@ export function DeviceManagement() {
             <span style={{ ...cellStyle, flex: 1 }}>{device.port}</span>
             <span style={{ ...cellStyle, flex: 1.5 }}>{device.username}</span>
             <span style={{ ...cellStyle, flex: 1.5, textAlign: 'right', display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button onClick={() => window.ssmVms.system.openInBrowser(device.host, device.httpPort)} style={linkButtonStyle}>
+                Open
+              </button>
               <button onClick={() => setDialog(device)} style={linkButtonStyle}>
                 Edit
               </button>

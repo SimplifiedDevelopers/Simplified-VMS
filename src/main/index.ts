@@ -4,14 +4,19 @@ import { registerAuthIpcHandlers } from './ipc/auth';
 import { registerDeviceIpcHandlers } from './ipc/devices';
 import { logoutAllSessions, registerLiveViewIpcHandlers } from './ipc/liveView';
 import { registerPrefsIpcHandlers } from './ipc/prefs';
+import { registerSettingsIpcHandlers } from './ipc/settings';
+import { registerSystemIpcHandlers } from './ipc/system';
+import { readSettings } from './store/settingsStore';
 
-// This runs on a Windows Server VM over RDP with no real GPU — Chromium's
-// GPU process was observed failing (GpuControl.CreateCommandBuffer errors).
-// A struggling/retrying GPU process can starve the rest of the app of CPU,
-// which is consistent with intermittent NET_DVR connect timeouts that never
-// reproduce in a bare Node/Electron-as-Node process with no Chromium
-// renderer at all.
-app.disableHardwareAcceleration();
+// disableHardwareAcceleration() must run before app.whenReady() and can't be
+// toggled live, so this reads the persisted setting synchronously up front.
+// Off by default only makes sense on underpowered/virtualized machines (this
+// dev VPS is one — no real GPU, Chromium's GPU process was observed failing
+// with GpuControl.CreateCommandBuffer errors); most client machines have a
+// real GPU and benefit from it, hence defaulting to enabled.
+if (!readSettings().hardwareAcceleration) {
+  app.disableHardwareAcceleration();
+}
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -50,6 +55,8 @@ app.whenReady().then(() => {
   registerAuthIpcHandlers();
   registerDeviceIpcHandlers();
   registerPrefsIpcHandlers();
+  registerSettingsIpcHandlers();
+  registerSystemIpcHandlers();
   createWindow();
 
   app.on('activate', () => {

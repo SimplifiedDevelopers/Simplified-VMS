@@ -61,6 +61,9 @@ export interface StoredDevice {
   vendor: VendorId;
   host: string;
   port: number;
+  // The device's web UI port — the VMS itself never talks to it, only used
+  // to open the device's browser-based admin page ("Open" action).
+  httpPort: number;
   username: string;
 }
 
@@ -69,6 +72,7 @@ export interface NewDeviceInput {
   vendor: VendorId;
   host: string;
   port: number;
+  httpPort: number;
   username: string;
   password: string;
 }
@@ -81,6 +85,14 @@ export interface SavedLogin {
   username: string;
   password: string;
   autoLogin: boolean;
+}
+
+// Electron's disableHardwareAcceleration() must be called before the app is
+// ready and can't be toggled live - this setting always needs a relaunch to
+// take effect. Defaults to enabled since most client machines have a real
+// GPU; only underpowered/virtualized ones need to turn it off.
+export interface AppSettings {
+  hardwareAcceleration: boolean;
 }
 
 // Result of a login+immediate-logout probe — doesn't persist a session,

@@ -44,6 +44,7 @@ function toRecord(id: string, input: NewDeviceInput): DeviceRecord {
     vendor: input.vendor,
     host: input.host,
     port: input.port,
+    httpPort: input.httpPort,
     username: input.username,
     encryptedPassword: safeStorage.encryptString(input.password).toString('base64'),
   };
