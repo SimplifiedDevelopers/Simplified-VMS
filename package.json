@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "build:hik-native": "npm run build --prefix native/hikvision",
     "build:unv-native": "npm run build --prefix native/uniview",
+    "build:dahua-native": "npm run build --prefix native/dahua",
     "dist:win": "npm run build && electron-builder --win"
   },
   "dependencies": {

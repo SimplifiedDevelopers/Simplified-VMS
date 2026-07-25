@@ -14,6 +14,8 @@ extraResources:
     to: native/hikvision/build/Release
   - from: native/uniview/build/Release
     to: native/uniview/build/Release
+  - from: native/dahua/build/Release
+    to: native/dahua/build/Release
 win:
   target: nsis
   artifactName: ${productName}-Setup-${version}.${ext}
