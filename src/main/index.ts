@@ -5,6 +5,14 @@ import { registerDeviceIpcHandlers } from './ipc/devices';
 import { logoutAllSessions, registerLiveViewIpcHandlers } from './ipc/liveView';
 import { registerPrefsIpcHandlers } from './ipc/prefs';
 
+// This runs on a Windows Server VM over RDP with no real GPU — Chromium's
+// GPU process was observed failing (GpuControl.CreateCommandBuffer errors).
+// A struggling/retrying GPU process can starve the rest of the app of CPU,
+// which is consistent with intermittent NET_DVR connect timeouts that never
+// reproduce in a bare Node/Electron-as-Node process with no Chromium
+// renderer at all.
+app.disableHardwareAcceleration();
+
 let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {
