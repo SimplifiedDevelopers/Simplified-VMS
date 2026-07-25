@@ -105,6 +105,29 @@ void DestroySession(LiveViewSession* session) {
   delete session;
 }
 
+// CLIENT_RealPlayEx with hWnd=NULL never triggered the decode callback at
+// all in real testing (confirmed: zero OnDecodedFrame calls, not a lookup
+// bug) - unlike Hikvision/Uniview/TVT, Dahua's decoder appears to need a
+// genuine window to render into even when the actual output is consumed
+// via the separate global decode callback instead. This creates one
+// reusable, permanently-hidden top-level window (never shown) to satisfy
+// that requirement without putting anything on screen.
+HWND GetOrCreateHiddenWindow() {
+  static HWND hiddenWnd = nullptr;
+  if (hiddenWnd) return hiddenWnd;
+
+  const wchar_t* className = L"SSMVMSDahuaHiddenWindow";
+  WNDCLASSW wc = {};
+  wc.lpfnWndProc = DefWindowProcW;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = className;
+  RegisterClassW(&wc);
+
+  hiddenWnd = CreateWindowExW(0, className, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr),
+                               nullptr);
+  return hiddenWnd;
+}
+
 }  // namespace
 
 Napi::Value Login(const Napi::CallbackInfo& info) {
@@ -172,7 +195,7 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   session->tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "dahua-frame-callback", 0, 1);
 
   const DH_RealPlayType rType = (streamType == "sub") ? DH_RType_Realplay_1 : DH_RType_Realplay_0;
-  const LLONG lRealHandle = CLIENT_RealPlayEx(lLoginID, channel, nullptr, rType);
+  const LLONG lRealHandle = CLIENT_RealPlayEx(lLoginID, channel, GetOrCreateHiddenWindow(), rType);
   if (lRealHandle == 0) {
     const DWORD err = CLIENT_GetLastError();
     session->tsfn.Release();
