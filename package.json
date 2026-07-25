@@ -1,6 +1,6 @@
 {
   "name": "ssm-vms",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Unified multi-vendor VMS desktop client (Hikvision, Dahua, TVT, Uniview)",
   "private": true,
   "main": "./out/main/index.js",
