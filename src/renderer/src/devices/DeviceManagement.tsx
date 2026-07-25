@@ -117,7 +117,7 @@ const addButtonStyle = {
   borderRadius: '5px',
   border: 'none',
   background: theme.accent,
-  color: '#04201c',
+  color: theme.accentText,
   fontSize: '12.5px',
   fontWeight: 600,
   cursor: 'pointer',
@@ -126,7 +126,7 @@ const addButtonStyle = {
 const linkButtonStyle = {
   background: 'none',
   border: 'none',
-  color: theme.accent,
+  color: theme.accentHover,
   fontSize: '12px',
   cursor: 'pointer',
   padding: 0,

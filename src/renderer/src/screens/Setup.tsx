@@ -135,7 +135,7 @@ const primaryButtonStyle: CSSProperties = {
   borderRadius: '5px',
   border: 'none',
   background: theme.accent,
-  color: '#04201c',
+  color: theme.accentText,
   fontSize: '13.5px',
   fontWeight: 700,
   cursor: 'pointer',

@@ -84,7 +84,7 @@ export function Playback() {
                 borderRadius: '4px',
                 border: `1px solid ${n === layout ? theme.accent : theme.border}`,
                 background: n === layout ? `${theme.accent}1f` : 'transparent',
-                color: n === layout ? theme.accent : theme.textMuted,
+                color: n === layout ? theme.accentHover : theme.textMuted,
                 fontSize: '11.5px',
                 cursor: 'pointer',
               }}
@@ -175,7 +175,7 @@ const searchButtonStyle = {
   borderRadius: '5px',
   border: 'none',
   background: theme.accent,
-  color: '#04201c',
+  color: theme.accentText,
   fontSize: '12.5px',
   fontWeight: 600,
 };

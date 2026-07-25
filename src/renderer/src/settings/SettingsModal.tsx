@@ -45,7 +45,7 @@ export function SettingsModal({ onClose }: Props) {
                 borderRadius: '5px',
                 border: 'none',
                 background: active === section ? `${theme.accent}1f` : 'transparent',
-                color: active === section ? theme.accent : theme.textMuted,
+                color: active === section ? theme.accentHover : theme.textMuted,
                 fontSize: '12.5px',
                 cursor: 'pointer',
                 marginBottom: '0.15rem',

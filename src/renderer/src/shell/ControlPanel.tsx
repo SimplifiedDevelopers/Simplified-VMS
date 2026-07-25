@@ -44,7 +44,7 @@ export function ControlPanel({ onOpen }: Props) {
             onMouseEnter={(e) => (e.currentTarget.style.borderColor = theme.accent)}
             onMouseLeave={(e) => (e.currentTarget.style.borderColor = theme.border)}
           >
-            <span style={{ fontSize: '30px', color: theme.accent }}>{card.glyph}</span>
+            <span style={{ fontSize: '30px', color: theme.accentHover }}>{card.glyph}</span>
             <span style={{ fontSize: '14px', fontWeight: 600 }}>{card.title}</span>
             <span style={{ fontSize: '11.5px', color: theme.textMuted, textAlign: 'center', lineHeight: 1.4 }}>
               {card.description}

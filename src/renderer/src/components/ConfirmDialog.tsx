@@ -43,7 +43,7 @@ const primaryButtonStyle = {
   borderRadius: '5px',
   border: 'none',
   background: theme.accent,
-  color: '#04201c',
+  color: theme.accentText,
   fontSize: '13px',
   fontWeight: 600,
   cursor: 'pointer',

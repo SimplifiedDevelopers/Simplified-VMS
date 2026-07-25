@@ -106,7 +106,7 @@ export function Login({ onLoggedIn }: Props) {
           <button
             type="button"
             onClick={() => setShowForgot((v) => !v)}
-            style={{ background: 'none', border: 'none', color: theme.accent, fontSize: '12px', cursor: 'pointer', padding: 0 }}
+            style={{ background: 'none', border: 'none', color: theme.accentHover, fontSize: '12px', cursor: 'pointer', padding: 0 }}
           >
             Forgot password?
           </button>
@@ -156,7 +156,7 @@ const primaryButtonStyle: CSSProperties = {
   borderRadius: '5px',
   border: 'none',
   background: theme.accent,
-  color: '#04201c',
+  color: theme.accentText,
   fontSize: '13.5px',
   fontWeight: 700,
   cursor: 'pointer',

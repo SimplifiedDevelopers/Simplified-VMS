@@ -8,9 +8,13 @@ export const theme = {
   text: '#e8edf2',
   textMuted: '#8b98a5',
   textFaint: '#5a6672',
-  accent: '#14b8a6',
-  accentHover: '#2dd4bf',
-  accentPressed: '#0d9488',
+  // Sampled directly from the SSM logo (Security Systems & MORE.png).
+  accent: '#00007f',
+  accentHover: '#1a1aa8',
+  accentPressed: '#00005c',
+  // Navy is dark — anything sitting on an accent-colored background needs
+  // light text, unlike the old teal which paired with dark text.
+  accentText: '#ffffff',
   danger: '#ef4444',
   warning: '#f59e0b',
   success: '#22c55e',

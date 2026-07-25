@@ -23,9 +23,19 @@ export function AuthLayout({ children }: Props) {
           overflow: 'hidden',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', zIndex: 1 }}>
-          <Logo size={30} />
-          <span style={{ fontSize: '16px', fontWeight: 700, color: theme.text }}>SSM VMS</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.7rem', zIndex: 1 }}>
+          <Logo height={32} />
+          <span
+            style={{
+              fontSize: '11.5px',
+              fontWeight: 700,
+              color: theme.accentHover,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+            }}
+          >
+            VMS
+          </span>
         </div>
 
         <div style={{ zIndex: 1, display: 'flex', justifyContent: 'center' }}>

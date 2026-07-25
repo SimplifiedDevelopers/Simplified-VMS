@@ -76,3 +76,19 @@ export function registerLiveViewIpcHandlers(getSender: () => WebContents): void 
     await getAdapter(session.vendor).stopLiveView(viewHandle);
   });
 }
+
+// Vendor SDKs (Hikvision included) cap concurrent logins per account on a
+// given device. Without this, every app restart during dev testing leaves
+// the previous session's login dangling on the device — nothing ever
+// called NET_DVR_Logout for it — and repeated restarts eventually exhaust
+// that limit, surfacing as a plain connect failure that looks unrelated.
+export async function logoutAllSessions(): Promise<void> {
+  await Promise.all(
+    Array.from(sessionsByDevice.values()).map((session) =>
+      getAdapter(session.vendor)
+        .logout(session.sessionId)
+        .catch(() => undefined),
+    ),
+  );
+  sessionsByDevice.clear();
+}

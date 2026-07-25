@@ -51,9 +51,18 @@ export function AppShell({ onLoggedOut }: Props) {
           gap: '0.6rem',
         }}
       >
-        <Logo size={22} />
-        <span style={{ fontSize: '13px', fontWeight: 700, color: theme.text, marginRight: '0.75rem' }}>
-          SSM VMS
+        <Logo height={22} />
+        <span
+          style={{
+            fontSize: '10.5px',
+            fontWeight: 700,
+            color: theme.accentHover,
+            letterSpacing: '0.06em',
+            textTransform: 'uppercase',
+            marginRight: '0.75rem',
+          }}
+        >
+          VMS
         </span>
 
         <div style={{ display: 'flex', alignItems: 'stretch', height: '100%', flex: 1, overflowX: 'auto' }}>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { theme } from '../theme';
+import logoWhite from '../assets/logo-white.png';
 
 interface Props {
   onDone: () => void;
@@ -39,10 +40,18 @@ export function Splash({ onDone }: Props) {
         background: theme.bg,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-        <Logo size={40} />
-        <span style={{ fontSize: '22px', fontWeight: 700, color: theme.text, letterSpacing: '0.01em' }}>
-          SSM VMS
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.9rem' }}>
+        <Logo height={54} />
+        <span
+          style={{
+            fontSize: '14px',
+            fontWeight: 700,
+            color: theme.accentHover,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          VMS
         </span>
       </div>
       <div style={{ width: '260px' }}>
@@ -68,29 +77,6 @@ export function Splash({ onDone }: Props) {
   );
 }
 
-export function Logo({ size = 28 }: { size?: number }) {
-  return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        borderRadius: '50%',
-        background: `radial-gradient(circle at 35% 30%, ${theme.accentHover}, ${theme.accentPressed} 70%)`,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        flexShrink: 0,
-        boxShadow: `0 0 0 2px ${theme.border}`,
-      }}
-    >
-      <div
-        style={{
-          width: size * 0.4,
-          height: size * 0.4,
-          borderRadius: '50%',
-          background: theme.bg,
-        }}
-      />
-    </div>
-  );
+export function Logo({ height = 24 }: { height?: number }) {
+  return <img src={logoWhite} alt="SSM" style={{ height, width: 'auto', flexShrink: 0 }} />;
 }

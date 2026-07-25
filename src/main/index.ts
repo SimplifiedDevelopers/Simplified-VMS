@@ -2,7 +2,7 @@ import { join } from 'path';
 import { app, BrowserWindow, shell } from 'electron';
 import { registerAuthIpcHandlers } from './ipc/auth';
 import { registerDeviceIpcHandlers } from './ipc/devices';
-import { registerLiveViewIpcHandlers } from './ipc/liveView';
+import { logoutAllSessions, registerLiveViewIpcHandlers } from './ipc/liveView';
 import { registerPrefsIpcHandlers } from './ipc/prefs';
 
 let mainWindow: BrowserWindow | null = null;
@@ -51,4 +51,12 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+let quitting = false;
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  quitting = true;
+  logoutAllSessions().finally(() => app.quit());
 });
