@@ -16,6 +16,8 @@ extraResources:
     to: native/uniview/build/Release
   - from: native/dahua/build/Release
     to: native/dahua/build/Release
+  - from: native/tvt/build/Release
+    to: native/tvt/build/Release
 win:
   target: nsis
   artifactName: ${productName}-Setup-${version}.${ext}

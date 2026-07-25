@@ -17,7 +17,7 @@ const DEFAULT_PORTS: Record<VendorId, number> = {
   dahua: 37777,
 };
 
-const SUPPORTED_VENDORS = new Set<VendorId>(['hikvision', 'uniview', 'dahua']);
+const SUPPORTED_VENDORS = new Set<VendorId>(['hikvision', 'uniview', 'dahua', 'tvt']);
 
 interface Props {
   initial: StoredDevice | null;

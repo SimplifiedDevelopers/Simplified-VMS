@@ -13,6 +13,7 @@
     "build:hik-native": "npm run build --prefix native/hikvision",
     "build:unv-native": "npm run build --prefix native/uniview",
     "build:dahua-native": "npm run build --prefix native/dahua",
+    "build:tvt-native": "npm run build --prefix native/tvt",
     "dist:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
