@@ -119,21 +119,19 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
   const std::string username = params.Get("username").As<Napi::String>().Utf8Value();
   const std::string password = params.Get("password").As<Napi::String>().Utf8Value();
 
-  NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY inParam = {};
-  inParam.dwSize = sizeof(inParam);
-  strncpy_s(inParam.szIP, host.c_str(), _TRUNCATE);
-  inParam.nPort = port;
-  strncpy_s(inParam.szUserName, username.c_str(), _TRUNCATE);
-  strncpy_s(inParam.szPassword, password.c_str(), _TRUNCATE);
-  inParam.emSpecCap = EM_LOGIN_SPEC_CAP_TCP;
-
-  NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY outParam = {};
-  outParam.dwSize = sizeof(outParam);
-
-  const LLONG lLoginID = CLIENT_LoginWithHighLevelSecurity(&inParam, &outParam);
+  // CLIENT_LoginWithHighLevelSecurity (the newer handshake) timed out
+  // against a real fleet device with confirmed-correct credentials on a
+  // confirmed-reachable port - some older/rebranded Dahua-family units
+  // don't support it at all and silently drop the attempt instead of
+  // rejecting it cleanly, which looks identical to a network timeout.
+  // CLIENT_LoginEx2 is the older, far more universally supported login
+  // call and is what actually worked.
+  NET_DEVICEINFO_Ex deviceInfo = {};
+  int error = 0;
+  const LLONG lLoginID = CLIENT_LoginEx2(host.c_str(), static_cast<WORD>(port), username.c_str(), password.c_str(),
+                                          EM_LOGIN_SPEC_CAP_TCP, nullptr, &deviceInfo, &error);
   if (lLoginID == 0) {
-    Napi::Error::New(env, "Dahua login failed (error " + std::to_string(outParam.nError) + ")")
-        .ThrowAsJavaScriptException();
+    Napi::Error::New(env, "Dahua login failed (error " + std::to_string(error) + ")").ThrowAsJavaScriptException();
     return env.Null();
   }
 
@@ -141,7 +139,7 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
   // IDs or a start offset (unlike Hikvision/Uniview) - Dahua's documented
   // convention is 0-based channel indexing. Unverified against real
   // hardware yet; adjust here if a real device rejects channel 0.
-  const int channelCount = outParam.stuDeviceInfo.nChanNum;
+  const int channelCount = deviceInfo.nChanNum;
   Napi::Array channels = Napi::Array::New(env);
   for (int i = 0; i < channelCount; ++i) {
     channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);

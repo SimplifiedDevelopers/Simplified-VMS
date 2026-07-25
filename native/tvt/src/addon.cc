@@ -15,6 +15,7 @@
 // channel/format assumption made before a vendor's first real test.
 #include <napi.h>
 #include <windows.h>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -36,7 +37,7 @@ std::unordered_map<POINTERHANDLE, LiveViewSession*> g_sessionsByHandle;
 struct FrameData {
   int width = 0;
   int height = 0;
-  long timestampMs = 0;
+  int64_t timestampMs = 0;
   std::vector<uint8_t> pixels;  // RGBA, ready for canvas ImageData
 };
 
@@ -80,7 +81,10 @@ void CALLBACK OnYUVFrame(POINTERHANDLE lLiveHandle, DECODE_FRAME_INFO frameInfo,
   auto* frame = new FrameData();
   frame->width = frameInfo.nWidth;
   frame->height = frameInfo.nHeight;
-  frame->timestampMs = static_cast<long>(frameInfo.time) * 1000;
+  // frameInfo.time is Unix seconds (~1.79 billion currently) - casting to a
+  // 32-bit long before multiplying by 1000 overflowed (confirmed live:
+  // negative garbage timestamps), hence the explicit int64_t here.
+  frame->timestampMs = static_cast<int64_t>(frameInfo.time) * 1000;
   ConvertI420ToRGBA(frameInfo, frame->pixels);
 
   auto status = session->tsfn.NonBlockingCall(
@@ -192,7 +196,11 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string viewHandle = info[0].As<Napi::String>().Utf8Value();
-  const POINTERHANDLE lLiveHandle = std::stol(viewHandle);
+  // POINTERHANDLE is `long long` (64-bit) - std::stol (32-bit long) was
+  // silently truncating/misparsing real handle values here, which crashed
+  // the process during cleanup (confirmed live: exit code 9 right after
+  // stopLiveView, handles like 2818686989344 are far beyond 32-bit range).
+  const POINTERHANDLE lLiveHandle = std::stoll(viewHandle);
 
   LiveViewSession* session = nullptr;
   {
