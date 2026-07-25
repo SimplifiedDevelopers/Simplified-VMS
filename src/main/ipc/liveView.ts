@@ -1,11 +1,15 @@
 import { ipcMain, type WebContents } from 'electron';
 import { getAdapter } from '../adapters/registry';
 import { getDeviceCredentials } from '../store/deviceStore';
-import type { DecodedFrame, StreamType, VendorId } from '../../shared/types';
+import type { ChannelInfo, DecodedFrame, StreamType, VendorId } from '../../shared/types';
 
 interface CachedSession {
   vendor: VendorId;
   sessionId: string;
+  analogStart: number;
+  analogCount: number;
+  digitalStart: number;
+  digitalCount: number;
 }
 
 // One login per device is reused across channels/tiles rather than
@@ -23,12 +27,37 @@ async function resolveSession(deviceId: string): Promise<CachedSession> {
 
   const adapter = getAdapter(credentials.vendor);
   const session = await adapter.login(credentials);
-  const cachedSession: CachedSession = { vendor: credentials.vendor, sessionId: session.sessionId };
+  const cachedSession: CachedSession = {
+    vendor: credentials.vendor,
+    sessionId: session.sessionId,
+    analogStart: session.analogStart,
+    analogCount: session.analogCount,
+    digitalStart: session.digitalStart,
+    digitalCount: session.digitalCount,
+  };
   sessionsByDevice.set(deviceId, cachedSession);
   return cachedSession;
 }
 
+function channelsFromSession(session: CachedSession): ChannelInfo[] {
+  const channels: ChannelInfo[] = [];
+  for (let i = 0; i < session.analogCount; i++) {
+    const channel = session.analogStart + i;
+    channels.push({ channel, label: `Channel ${channel}` });
+  }
+  for (let i = 0; i < session.digitalCount; i++) {
+    const channel = session.digitalStart + i;
+    channels.push({ channel, label: `Channel ${channel}` });
+  }
+  return channels;
+}
+
 export function registerLiveViewIpcHandlers(getSender: () => WebContents): void {
+  ipcMain.handle('liveView:getChannels', async (_event, deviceId: string): Promise<ChannelInfo[]> => {
+    const session = await resolveSession(deviceId);
+    return channelsFromSession(session);
+  });
+
   ipcMain.handle(
     'liveView:start',
     async (_event, deviceId: string, channel: number, streamType: StreamType) => {

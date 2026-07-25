@@ -178,11 +178,22 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
     return env.Null();
   }
 
-  const int channelCount = deviceInfo.struDeviceV30.byChanNum + deviceInfo.struDeviceV30.byIPChanNum;
+  const auto& dev = deviceInfo.struDeviceV30;
+  const int channelCount = dev.byChanNum + dev.byIPChanNum;
 
+  // Hybrid/NVR devices number analog and digital(IP) channels in two
+  // separate ranges — confirmed against real hardware: a pure-IP 16-channel
+  // NVR rejected channel 1 (NET_DVR_CHANNEL_ERROR) and only accepted
+  // channels starting at byStartDChan (33 on that unit). Exposing both
+  // ranges lets the renderer build an accurate channel list instead of
+  // guessing a 1-based range.
   Napi::Object result = Napi::Object::New(env);
   result.Set("sessionId", std::to_string(lUserID));
   result.Set("channelCount", channelCount);
+  result.Set("analogStart", static_cast<int>(dev.byStartChan));
+  result.Set("analogCount", static_cast<int>(dev.byChanNum));
+  result.Set("digitalStart", static_cast<int>(dev.byStartDChan));
+  result.Set("digitalCount", static_cast<int>(dev.byIPChanNum));
   return result;
 }
 

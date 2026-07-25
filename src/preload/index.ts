@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AuthStatus,
+  ChannelInfo,
   DecodedFrame,
   NewDeviceInput,
   SavedLogin,
@@ -32,6 +33,8 @@ const devices = {
 };
 
 const liveView = {
+  getChannels: (deviceId: string): Promise<ChannelInfo[]> => ipcRenderer.invoke('liveView:getChannels', deviceId),
+
   start: (deviceId: string, channel: number, streamType: StreamType): Promise<string> =>
     ipcRenderer.invoke('liveView:start', deviceId, channel, streamType),
 

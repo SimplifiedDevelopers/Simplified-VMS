@@ -26,6 +26,19 @@ export interface LoginParams {
 export interface DeviceSession {
   sessionId: string;
   channelCount: number;
+  // Analog and digital(IP) channels are numbered in separate ranges on
+  // hybrid/NVR hardware — a device can have 0 analog + N digital channels
+  // starting well above 1 (confirmed: a pure-IP 16-channel NVR only accepts
+  // channels 33-48). Needed to build an accurate channel list per device.
+  analogStart: number;
+  analogCount: number;
+  digitalStart: number;
+  digitalCount: number;
+}
+
+export interface ChannelInfo {
+  channel: number;
+  label: string;
 }
 
 export type StreamType = 'main' | 'sub';
