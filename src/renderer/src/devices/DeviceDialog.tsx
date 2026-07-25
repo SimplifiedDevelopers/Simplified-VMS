@@ -1,7 +1,14 @@
 import { useState, type CSSProperties, type FormEvent } from 'react';
 import { theme } from '../theme';
 import { Modal } from '../components/Modal';
-import { VENDOR_LABELS, VENDOR_ORDER, type NewDeviceInput, type StoredDevice, type VendorId } from '../../../shared/types';
+import {
+  VENDOR_LABELS,
+  VENDOR_ORDER,
+  type ConnectionTestResult,
+  type NewDeviceInput,
+  type StoredDevice,
+  type VendorId,
+} from '../../../shared/types';
 
 const DEFAULT_PORTS: Record<VendorId, number> = {
   tvt: 6036,
@@ -27,10 +34,31 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [testing, setTesting] = useState(false);
 
   function selectVendor(v: VendorId): void {
     setVendor(v);
     if (!initial) setPort(String(DEFAULT_PORTS[v]));
+    setTestResult(null);
+  }
+
+  async function handleTest(): Promise<void> {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await window.ssmVms.devices.testConnection({
+        name: name.trim(),
+        vendor,
+        host: host.trim(),
+        port: Number(port),
+        username,
+        password,
+      });
+      setTestResult(result);
+    } finally {
+      setTesting(false);
+    }
   }
 
   async function handleSubmit(e: FormEvent): Promise<void> {
@@ -115,6 +143,20 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
             />
           </Field>
 
+          {testResult && (
+            <div
+              style={{
+                fontSize: '12px',
+                color: testResult.ok ? theme.success : theme.danger,
+                lineHeight: 1.4,
+              }}
+            >
+              {testResult.ok
+                ? `✓ Connected — ${testResult.channelCount} channel${testResult.channelCount === 1 ? '' : 's'}`
+                : `✗ ${testResult.error}`}
+            </div>
+          )}
+
           {error && <div style={{ fontSize: '12px', color: theme.danger }}>{error}</div>}
         </div>
 
@@ -122,16 +164,29 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
           style={{
             padding: '0 1.4rem 1.25rem',
             display: 'flex',
-            justifyContent: 'flex-end',
+            justifyContent: 'space-between',
+            alignItems: 'center',
             gap: '0.6rem',
           }}
         >
-          <button type="button" onClick={onCancel} style={secondaryButtonStyle}>
-            Cancel
+          <button
+            type="button"
+            onClick={handleTest}
+            disabled={testing || !host.trim() || !password}
+            title={!password ? 'Enter the password to test' : undefined}
+            style={{ ...secondaryButtonStyle, opacity: testing || !host.trim() || !password ? 0.5 : 1 }}
+          >
+            {testing ? 'Testing…' : 'Test Connection'}
           </button>
-          <button type="submit" disabled={busy} style={primaryButtonStyle}>
-            {busy ? 'Saving…' : initial ? 'Save' : 'Add'}
-          </button>
+
+          <div style={{ display: 'flex', gap: '0.6rem' }}>
+            <button type="button" onClick={onCancel} style={secondaryButtonStyle}>
+              Cancel
+            </button>
+            <button type="submit" disabled={busy} style={primaryButtonStyle}>
+              {busy ? 'Saving…' : initial ? 'Save' : 'Add'}
+            </button>
+          </div>
         </div>
       </form>
     </Modal>

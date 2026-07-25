@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AuthStatus,
   ChannelInfo,
+  ConnectionTestResult,
   DecodedFrame,
   NewDeviceInput,
   SavedLogin,
@@ -30,6 +31,9 @@ const devices = {
   update: (id: string, input: NewDeviceInput): Promise<StoredDevice> =>
     ipcRenderer.invoke('devices:update', id, input),
   delete: (id: string): Promise<void> => ipcRenderer.invoke('devices:delete', id),
+  testConnection: (input: NewDeviceInput): Promise<ConnectionTestResult> =>
+    ipcRenderer.invoke('devices:testConnection', input),
+  checkStatus: (id: string): Promise<ConnectionTestResult> => ipcRenderer.invoke('devices:checkStatus', id),
 };
 
 const liveView = {

@@ -82,3 +82,12 @@ export interface SavedLogin {
   password: string;
   autoLogin: boolean;
 }
+
+// Result of a login+immediate-logout probe — doesn't persist a session,
+// used both to test connectivity before saving a device and to show
+// online/offline status for already-saved ones.
+export interface ConnectionTestResult {
+  ok: boolean;
+  channelCount?: number;
+  error?: string;
+}
