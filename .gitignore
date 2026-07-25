@@ -1,8 +1,7 @@
 node_modules/
 out/
 dist/
-build/*.exe
-build/*.msi
+release/
 native/*/build/
 .DS_Store
 *.log

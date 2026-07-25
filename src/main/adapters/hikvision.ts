@@ -1,4 +1,5 @@
 import { join } from 'path';
+import { app } from 'electron';
 import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../../shared/types';
 import type { VmsAdapter } from './vmsAdapter';
 
@@ -24,11 +25,20 @@ interface NativeAddon {
 
 let cachedNative: NativeAddon | null = null;
 
+function resolveAddonPath(): string {
+  // Packaged builds ship the addon under extraResources (see
+  // electron-builder.yml) — it must stay outside app.asar since Windows
+  // can't LoadLibrary a DLL from inside an asar archive.
+  if (app.isPackaged) {
+    return join(process.resourcesPath, 'native/hikvision/build/Release/hikvision_native.node');
+  }
+  return join(__dirname, '../../native/hikvision/build/Release/hikvision_native.node');
+}
+
 function loadNative(): NativeAddon {
   if (!cachedNative) {
-    const addonPath = join(__dirname, '../../native/hikvision/build/Release/hikvision_native.node');
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    cachedNative = require(addonPath) as NativeAddon;
+    cachedNative = require(resolveAddonPath()) as NativeAddon;
   }
   return cachedNative;
 }

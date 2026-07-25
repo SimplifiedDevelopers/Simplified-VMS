@@ -1,0 +1,22 @@
+appId: net.simplifieddevs.ssmvms
+productName: SSM VMS
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+# The Hikvision addon (.node + its runtime DLLs, including the HCNetSDKCom
+# plugin folder it dynamically loads) must live outside app.asar as plain
+# files on disk — Windows can't LoadLibrary a DLL from inside an asar
+# archive. resourcesPath at runtime is resources/native/... to match.
+extraResources:
+  - from: native/hikvision/build/Release
+    to: native/hikvision/build/Release
+win:
+  target: nsis
+  artifactName: ${productName}-Setup-${version}.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
