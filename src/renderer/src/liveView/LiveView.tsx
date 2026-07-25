@@ -28,6 +28,7 @@ export function LiveView() {
   const [expandedDeviceId, setExpandedDeviceId] = useState<string | null>(null);
   const [channelsByDevice, setChannelsByDevice] = useState<Record<string, ChannelInfo[]>>({});
   const [loadingChannelsFor, setLoadingChannelsFor] = useState<string | null>(null);
+  const [channelErrors, setChannelErrors] = useState<Record<string, string | null>>({});
   const tilesRef = useRef(tiles);
   tilesRef.current = tiles;
   const channelsRef = useRef(channelsByDevice);
@@ -53,15 +54,25 @@ export function LiveView() {
     return channels;
   }
 
+  async function loadChannels(deviceId: string): Promise<void> {
+    setLoadingChannelsFor(deviceId);
+    setChannelErrors((prev) => ({ ...prev, [deviceId]: null }));
+    try {
+      await ensureChannels(deviceId);
+    } catch (err) {
+      setChannelErrors((prev) => ({ ...prev, [deviceId]: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setLoadingChannelsFor(null);
+    }
+  }
+
   async function toggleExpand(deviceId: string): Promise<void> {
     if (expandedDeviceId === deviceId) {
       setExpandedDeviceId(null);
       return;
     }
     setExpandedDeviceId(deviceId);
-    setLoadingChannelsFor(deviceId);
-    await ensureChannels(deviceId);
-    setLoadingChannelsFor(null);
+    await loadChannels(deviceId);
   }
 
   async function assign(
@@ -103,7 +114,13 @@ export function LiveView() {
   }
 
   async function playAllChannels(deviceId: string): Promise<void> {
-    const channels = await ensureChannels(deviceId);
+    let channels: ChannelInfo[];
+    try {
+      channels = await ensureChannels(deviceId);
+    } catch (err) {
+      setChannelErrors((prev) => ({ ...prev, [deviceId]: err instanceof Error ? err.message : String(err) }));
+      return;
+    }
     if (channels.length === 0) return;
     const device = devices.find((d) => d.id === deviceId);
     if (!device) return;
@@ -213,6 +230,26 @@ export function LiveView() {
               <div style={{ paddingLeft: '1.4rem' }}>
                 {loadingChannelsFor === device.id && (
                   <div style={{ fontSize: '11px', color: theme.textFaint, padding: '0.3rem 0' }}>Loading…</div>
+                )}
+                {channelErrors[device.id] && (
+                  <div style={{ padding: '0.3rem 0', display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                    <span style={{ fontSize: '11px', color: theme.danger }}>{channelErrors[device.id]}</span>
+                    <button
+                      onClick={() => loadChannels(device.id)}
+                      style={{
+                        alignSelf: 'flex-start',
+                        background: 'none',
+                        border: `1px solid ${theme.borderLight}`,
+                        borderRadius: '4px',
+                        color: theme.textMuted,
+                        fontSize: '10.5px',
+                        padding: '0.15rem 0.5rem',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Retry
+                    </button>
+                  </div>
                 )}
                 {(channelsByDevice[device.id] ?? []).map((ch) => (
                   <div
