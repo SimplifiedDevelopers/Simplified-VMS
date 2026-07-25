@@ -1,7 +1,6 @@
 import { HikvisionAdapter } from './hikvision';
 import type { VmsAdapter } from './vmsAdapter';
-
-export type VendorId = 'hikvision' | 'dahua' | 'tvt' | 'uniview';
+import type { VendorId } from '../../shared/types';
 
 const adapters: Partial<Record<VendorId, VmsAdapter>> = {
   hikvision: new HikvisionAdapter(),

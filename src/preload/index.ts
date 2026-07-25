@@ -1,6 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../main/adapters/vmsAdapter';
-import type { VendorId } from '../main/adapters/registry';
+import type { DecodedFrame, DeviceSession, LoginParams, StreamType, VendorId } from '../shared/types';
 
 const vms = {
   login: (vendor: VendorId, params: LoginParams): Promise<DeviceSession> =>

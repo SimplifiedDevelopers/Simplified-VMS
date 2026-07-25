@@ -1,31 +1,67 @@
-import type { DecodedFrame, DeviceSession, LoginParams, StreamType, VmsAdapter } from './vmsAdapter';
+import { join } from 'path';
+import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../../shared/types';
+import type { VmsAdapter } from './vmsAdapter';
 
-/**
- * Wraps the Hikvision HCNetSDK + PlayCtrl native addon (build/hikvision-native).
- * The addon isn't built yet — this throws until that lands so the rest of the
- * app (UI, IPC wiring) can be built and tested against the interface now.
- */
+interface NativeFrame {
+  width: number;
+  height: number;
+  format: 'rgb32';
+  timestampMs: number;
+  data: Buffer;
+}
+
+interface NativeAddon {
+  login(params: LoginParams): DeviceSession;
+  logout(sessionId: string): void;
+  startLiveView(
+    sessionId: string,
+    channel: number,
+    streamType: StreamType,
+    onFrame: (frame: NativeFrame) => void,
+  ): string;
+  stopLiveView(viewHandle: string): void;
+}
+
+let cachedNative: NativeAddon | null = null;
+
+function loadNative(): NativeAddon {
+  if (!cachedNative) {
+    const addonPath = join(__dirname, '../../native/hikvision/build/Release/hikvision_native.node');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    cachedNative = require(addonPath) as NativeAddon;
+  }
+  return cachedNative;
+}
+
 export class HikvisionAdapter implements VmsAdapter {
   readonly vendor = 'hikvision';
 
-  async login(_params: LoginParams): Promise<DeviceSession> {
-    throw new Error('Hikvision native addon not built yet');
+  async login(params: LoginParams): Promise<DeviceSession> {
+    return loadNative().login(params);
   }
 
-  async logout(_sessionId: string): Promise<void> {
-    throw new Error('Hikvision native addon not built yet');
+  async logout(sessionId: string): Promise<void> {
+    loadNative().logout(sessionId);
   }
 
   async startLiveView(
-    _sessionId: string,
-    _channel: number,
-    _streamType: StreamType,
-    _onFrame: (frame: DecodedFrame) => void,
+    sessionId: string,
+    channel: number,
+    streamType: StreamType,
+    onFrame: (frame: DecodedFrame) => void,
   ): Promise<string> {
-    throw new Error('Hikvision native addon not built yet');
+    return loadNative().startLiveView(sessionId, channel, streamType, (frame) => {
+      onFrame({
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        data: frame.data,
+        timestampMs: frame.timestampMs,
+      });
+    });
   }
 
-  async stopLiveView(_viewHandle: string): Promise<void> {
-    throw new Error('Hikvision native addon not built yet');
+  async stopLiveView(viewHandle: string): Promise<void> {
+    loadNative().stopLiveView(viewHandle);
   }
 }

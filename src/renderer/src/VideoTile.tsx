@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import type { DecodedFrame } from '../../main/adapters/vmsAdapter';
+import type { DecodedFrame } from '../../shared/types';
 
 interface Props {
   sessionId: string;

@@ -1,6 +1,6 @@
 import { ipcMain, type WebContents } from 'electron';
-import { getAdapter, type VendorId } from './adapters/registry';
-import type { DecodedFrame, LoginParams, StreamType } from './adapters/vmsAdapter';
+import { getAdapter } from './adapters/registry';
+import type { DecodedFrame, LoginParams, StreamType, VendorId } from '../shared/types';
 
 interface ActiveSession {
   vendor: VendorId;

@@ -1,24 +1,4 @@
-export interface LoginParams {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-}
-
-export interface DeviceSession {
-  sessionId: string;
-  channelCount: number;
-}
-
-export type StreamType = 'main' | 'sub';
-
-export interface DecodedFrame {
-  width: number;
-  height: number;
-  format: 'rgb32' | 'yuv420p';
-  data: Buffer;
-  timestampMs: number;
-}
+import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../../shared/types';
 
 /**
  * One implementation per vendor (Hikvision, Dahua, TVT, Uniview), all wrapping
