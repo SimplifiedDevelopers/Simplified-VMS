@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { theme } from '../theme';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { VENDOR_LABELS, type ConnectionTestResult, type NewDeviceInput, type StoredDevice } from '../../../shared/types';
+import type { DeviceConnectionStatus, NewDeviceInput, StoredDevice } from '../../../shared/types';
+import { VENDOR_LABELS } from '../../../shared/types';
 import { DeviceDialog } from './DeviceDialog';
 
-type Status = ConnectionTestResult | 'checking' | undefined;
+type Status = DeviceConnectionStatus | undefined;
 
 export function DeviceManagement() {
   const [devices, setDevices] = useState<StoredDevice[]>([]);
@@ -17,24 +18,34 @@ export function DeviceManagement() {
     const list = await window.ssmVms.devices.list();
     setDevices(list);
     setLoading(false);
-    checkAllStatuses(list);
+    // Every device is already connected (or connecting) in the background
+    // via the app-wide connection manager — this just reads the current
+    // cached status instantly, it doesn't reconnect anything. Live updates
+    // after this come from the devices:statusChanged subscription below.
+    list.forEach((device) => {
+      window.ssmVms.devices.getStatus(device.id).then((status) => {
+        setStatusById((prev) => ({ ...prev, [device.id]: status }));
+      });
+    });
   }
 
-  function checkAllStatuses(list: StoredDevice[]): void {
-    setStatusById((prev) => {
-      const next = { ...prev };
-      list.forEach((d) => (next[d.id] = 'checking'));
-      return next;
-    });
-    list.forEach((device) => {
-      window.ssmVms.devices.checkStatus(device.id).then((result) => {
-        setStatusById((prev) => ({ ...prev, [device.id]: result }));
+  function refreshStatusNow(): void {
+    devices.forEach((device) => {
+      setStatusById((prev) => ({ ...prev, [device.id]: { state: 'connecting' } }));
+      window.ssmVms.devices.checkStatus(device.id).then((status) => {
+        setStatusById((prev) => ({ ...prev, [device.id]: status }));
       });
     });
   }
 
   useEffect(() => {
     refresh();
+  }, []);
+
+  useEffect(() => {
+    return window.ssmVms.devices.onStatusChanged((deviceId, status) => {
+      setStatusById((prev) => ({ ...prev, [deviceId]: status }));
+    });
   }, []);
 
   async function handleSave(input: NewDeviceInput): Promise<void> {
@@ -61,7 +72,7 @@ export function DeviceManagement() {
           Managed Devices ({devices.length})
         </span>
         <div style={{ display: 'flex', gap: '0.6rem' }}>
-          <button onClick={() => checkAllStatuses(devices)} style={secondaryButtonStyle}>
+          <button onClick={refreshStatusNow} style={secondaryButtonStyle}>
             Refresh Status
           </button>
           <button onClick={() => setDialog('add')} style={addButtonStyle}>
@@ -129,17 +140,18 @@ export function DeviceManagement() {
 
 function StatusBadge({ status }: { status: Status }) {
   if (!status) return <span style={{ fontSize: '11.5px', color: theme.textFaint }}>—</span>;
-  if (status === 'checking') {
-    return <span style={{ fontSize: '11.5px', color: theme.textFaint }}>Checking…</span>;
+  if (status.state === 'connecting') {
+    return <span style={{ fontSize: '11.5px', color: theme.textFaint }}>Connecting…</span>;
   }
-  const color = status.ok ? theme.success : theme.danger;
+  const online = status.state === 'online';
+  const color = online ? theme.success : theme.danger;
   return (
     <span
       style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '11.5px', color }}
-      title={status.ok ? undefined : status.error}
+      title={online ? undefined : status.error}
     >
       <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: color, flexShrink: 0 }} />
-      {status.ok ? 'Online' : 'Offline'}
+      {online ? 'Online' : 'Offline'}
     </span>
   );
 }

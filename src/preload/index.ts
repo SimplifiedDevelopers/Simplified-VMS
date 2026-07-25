@@ -5,10 +5,12 @@ import type {
   ChannelInfo,
   ConnectionTestResult,
   DecodedFrame,
+  DeviceConnectionStatus,
   NewDeviceInput,
   SavedLogin,
   StoredDevice,
   StreamType,
+  SystemStats,
 } from '../shared/types';
 
 const auth = {
@@ -34,7 +36,22 @@ const devices = {
   delete: (id: string): Promise<void> => ipcRenderer.invoke('devices:delete', id),
   testConnection: (input: NewDeviceInput): Promise<ConnectionTestResult> =>
     ipcRenderer.invoke('devices:testConnection', input),
-  checkStatus: (id: string): Promise<ConnectionTestResult> => ipcRenderer.invoke('devices:checkStatus', id),
+  // Cached status from the app's persistent connection to this device — no
+  // network round-trip.
+  getStatus: (id: string): Promise<DeviceConnectionStatus | undefined> =>
+    ipcRenderer.invoke('devices:getStatus', id),
+  // Forces a real reconnect attempt right now (the "Refresh Status" button).
+  checkStatus: (id: string): Promise<DeviceConnectionStatus | undefined> =>
+    ipcRenderer.invoke('devices:checkStatus', id),
+  // Live push whenever any device's connection status changes (connects,
+  // drops, or a background heartbeat retry succeeds/fails) — lets Device
+  // Management show real-time status without polling.
+  onStatusChanged: (callback: (deviceId: string, status: DeviceConnectionStatus) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, deviceId: string, status: DeviceConnectionStatus): void =>
+      callback(deviceId, status);
+    ipcRenderer.on('devices:statusChanged', listener);
+    return () => ipcRenderer.removeListener('devices:statusChanged', listener);
+  },
 };
 
 // A single shared ipcRenderer listener dispatches to per-viewHandle
@@ -85,6 +102,14 @@ const settings = {
 const system = {
   restart: (): Promise<void> => ipcRenderer.invoke('system:restart'),
   openInBrowser: (host: string, port: number): Promise<void> => ipcRenderer.invoke('system:openInBrowser', host, port),
+  // Live CPU/memory usage of the machine running the app, pushed every 2s —
+  // shown in the Live View toolbar so the user can tell if the machine is
+  // under strain from decoding many channels at once.
+  onStats: (callback: (stats: SystemStats) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, stats: SystemStats): void => callback(stats);
+    ipcRenderer.on('system:stats', listener);
+    return () => ipcRenderer.removeListener('system:stats', listener);
+  },
 };
 
 const api = { auth, prefs, devices, liveView, settings, system };

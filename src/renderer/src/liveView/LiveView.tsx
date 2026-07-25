@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { theme } from '../theme';
-import type { ChannelInfo, StoredDevice, StreamType } from '../../../shared/types';
+import type { ChannelInfo, DeviceConnectionStatus, StoredDevice, StreamType, SystemStats } from '../../../shared/types';
 import { VideoCanvas } from './VideoCanvas';
 import { AssignDeviceDialog } from './AssignDeviceDialog';
 
@@ -12,7 +12,7 @@ interface TileState {
   error: string | null;
 }
 
-const LAYOUTS = [1, 4, 9, 16] as const;
+const LAYOUTS = [1, 4, 9, 16, 25, 36, 64] as const;
 
 interface DragPayload {
   type: 'device' | 'channel';
@@ -33,10 +33,42 @@ export function LiveView() {
   tilesRef.current = tiles;
   const channelsRef = useRef(channelsByDevice);
   channelsRef.current = channelsByDevice;
+  const playAllChannelsTokenRef = useRef(0);
+  const [stats, setStats] = useState<SystemStats | null>(null);
+  const [statusById, setStatusById] = useState<Record<string, DeviceConnectionStatus | undefined>>({});
+  // Single click selects a tile (highlighted outline) as the target for the
+  // next channel picked from the sidebar, instead of always falling back to
+  // "first empty tile" — lets you point at a specific spot in the grid
+  // before choosing what plays there. Double-click a filled tile to expand
+  // it to fill the whole grid; double-click again to restore exactly what
+  // was there before (every other tile's stream keeps running in the
+  // background the whole time — expanding just stops rendering them, it
+  // never calls stop() on their sessions).
+  const [selectedTileIndex, setSelectedTileIndex] = useState<number | null>(null);
+  const [expandedTileIndex, setExpandedTileIndex] = useState<number | null>(null);
 
   useEffect(() => {
-    window.ssmVms.devices.list().then(setDevices);
+    window.ssmVms.devices.list().then((list) => {
+      setDevices(list);
+      list.forEach((device) => {
+        window.ssmVms.devices.getStatus(device.id).then((status) => {
+          setStatusById((prev) => ({ ...prev, [device.id]: status }));
+        });
+      });
+    });
   }, []);
+
+  // Live push whenever any device's connection status changes — same
+  // status the connection manager keeps for Device Management, just shown
+  // here too so the device you're about to drag into the grid already
+  // tells you whether it's actually reachable.
+  useEffect(() => {
+    return window.ssmVms.devices.onStatusChanged((deviceId, status) => {
+      setStatusById((prev) => ({ ...prev, [deviceId]: status }));
+    });
+  }, []);
+
+  useEffect(() => window.ssmVms.system.onStats(setStats), []);
 
   useEffect(() => {
     return () => {
@@ -80,9 +112,9 @@ export function LiveView() {
     deviceId: string,
     channel: number,
     streamType: StreamType,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const device = devices.find((d) => d.id === deviceId);
-    if (!device) return;
+    if (!device) return false;
     setAssigning(null);
     const existing = tilesRef.current[tileIndex];
     if (existing?.viewHandle) {
@@ -95,16 +127,24 @@ export function LiveView() {
     try {
       const viewHandle = await window.ssmVms.liveView.start(deviceId, channel, streamType);
       setTiles((prev) => ({ ...prev, [tileIndex]: { ...prev[tileIndex], viewHandle } }));
+      return true;
     } catch (err) {
       setTiles((prev) => ({
         ...prev,
         [tileIndex]: { ...prev[tileIndex], error: err instanceof Error ? err.message : String(err) },
       }));
+      return false;
     }
   }
 
-  function assignToFirstEmptyTile(deviceId: string, channel: number): void {
+  // A selected tile (single-clicked in the grid) takes priority as the
+  // target — otherwise falls back to the first empty tile, same as before.
+  function assignToSelectedOrFirstEmptyTile(deviceId: string, channel: number): void {
     const streamType: StreamType = layout === 1 ? 'main' : 'sub';
+    if (selectedTileIndex !== null && selectedTileIndex < layout) {
+      assign(selectedTileIndex, deviceId, channel, streamType);
+      return;
+    }
     for (let i = 0; i < layout; i++) {
       if (!tilesRef.current[i]) {
         assign(i, deviceId, channel, streamType);
@@ -114,13 +154,27 @@ export function LiveView() {
   }
 
   async function playAllChannels(deviceId: string): Promise<void> {
+    // Nothing previously stopped a second playAllChannels call (e.g. the
+    // user switching to another device and back) from starting while an
+    // earlier call's staggered loop below was still mid-flight. The two
+    // loops then raced on the same `tiles` state and fired overlapping
+    // startLiveView calls - confirmed live as the cause of a real freeze
+    // (wrong tile count, channels stuck "Connecting…" forever) on top of
+    // the NETDEV errors below. This token makes a newer call cancel any
+    // older one still running: after every await, a stale loop checks its
+    // token against the latest one and bails out instead of continuing to
+    // issue calls into state a newer call has already taken over.
+    const token = ++playAllChannelsTokenRef.current;
+
     let channels: ChannelInfo[];
     try {
       channels = await ensureChannels(deviceId);
     } catch (err) {
+      if (token !== playAllChannelsTokenRef.current) return;
       setChannelErrors((prev) => ({ ...prev, [deviceId]: err instanceof Error ? err.message : String(err) }));
       return;
     }
+    if (token !== playAllChannelsTokenRef.current) return;
     if (channels.length === 0) return;
     const device = devices.find((d) => d.id === deviceId);
     if (!device) return;
@@ -133,10 +187,47 @@ export function LiveView() {
         tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
       ),
     );
+    if (token !== playAllChannelsTokenRef.current) return;
     setTiles({});
     setLayout(neededLayout);
+    setSelectedTileIndex(null);
+    setExpandedTileIndex(null);
 
-    channels.slice(0, neededLayout).forEach((ch, i) => assign(i, deviceId, ch.channel, streamType));
+    // Firing every channel's startLiveView back-to-back with no gap
+    // overwhelmed a real Uniview NVR's per-stream session/key negotiation -
+    // confirmed live: calls failed with NETDEV_E_INVALID_PARAM and an
+    // undocumented error 60067 (one below the SDK's own documented
+    // NETDEV_E_PUBLICKEYFAIL=60068, pointing at a security/key handshake
+    // resource that can't be reused too quickly). The 300ms stagger below
+    // (plus the per-session native mutex) fixed the app freeze/crash this
+    // used to cause, but individual channels can still fail on their first
+    // attempt while the device is under load from opening many streams at
+    // once. Rather than giving up on the rest of the grid the moment that
+    // happens (which was leaving several channels permanently unopened even
+    // though they'd have worked fine on their own), every channel gets
+    // attempted, and whichever ones failed get one retry pass after a
+    // cool-down long enough for the device's negotiation backlog to clear.
+    const channelsToPlay = channels.slice(0, neededLayout);
+
+    async function attemptPass(indices: number[]): Promise<number[]> {
+      const failed: number[] = [];
+      for (const i of indices) {
+        if (token !== playAllChannelsTokenRef.current) return [];
+        const ok = await assign(i, deviceId, channelsToPlay[i].channel, streamType);
+        if (token !== playAllChannelsTokenRef.current) return [];
+        if (!ok) failed.push(i);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return failed;
+    }
+
+    const firstPassFailures = await attemptPass(channelsToPlay.map((_, i) => i));
+    if (token !== playAllChannelsTokenRef.current) return;
+    if (firstPassFailures.length > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      if (token !== playAllChannelsTokenRef.current) return;
+      await attemptPass(firstPassFailures);
+    }
   }
 
   async function clearTile(tileIndex: number): Promise<void> {
@@ -149,6 +240,8 @@ export function LiveView() {
       delete next[tileIndex];
       return next;
     });
+    setSelectedTileIndex((prev) => (prev === tileIndex ? null : prev));
+    setExpandedTileIndex((prev) => (prev === tileIndex ? null : prev));
   }
 
   async function changeLayout(next: (typeof LAYOUTS)[number]): Promise<void> {
@@ -159,6 +252,8 @@ export function LiveView() {
     );
     setTiles({});
     setLayout(next);
+    setSelectedTileIndex(null);
+    setExpandedTileIndex(null);
   }
 
   function handleTileDrop(tileIndex: number, e: React.DragEvent): void {
@@ -180,6 +275,111 @@ export function LiveView() {
   }
 
   const columns = Math.ceil(Math.sqrt(layout));
+  const rows = Math.ceil(layout / columns);
+  const displayIndices = expandedTileIndex !== null ? [expandedTileIndex] : Array.from({ length: layout }, (_, i) => i);
+  const gridColumns = expandedTileIndex !== null ? 1 : columns;
+  const gridRows = expandedTileIndex !== null ? 1 : rows;
+
+  function renderTile(i: number) {
+    const tile = tiles[i];
+    const isSelected = selectedTileIndex === i;
+    const isExpanded = expandedTileIndex === i;
+    return (
+      <div
+        key={i}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => handleTileDrop(i, e)}
+        onClick={() => setSelectedTileIndex((prev) => (prev === i ? null : i))}
+        onDoubleClick={() => {
+          if (!tile) return;
+          setExpandedTileIndex((prev) => (prev === i ? null : i));
+        }}
+        style={{
+          position: 'relative',
+          background: '#000',
+          minHeight: 0,
+          cursor: 'pointer',
+          // outline (not border) so the highlight never nudges the grid's
+          // precise pixel sizing — that broke once already (the
+          // gridTemplateRows fix) and outline doesn't participate in the
+          // box model the way border does.
+          outline: isSelected ? `2px solid ${theme.accent}` : 'none',
+          outlineOffset: '-2px',
+        }}
+      >
+        {!tile && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setAssigning(i);
+            }}
+            style={{
+              width: '100%',
+              height: '100%',
+              border: 'none',
+              background: 'transparent',
+              color: theme.textFaint,
+              fontSize: '26px',
+              cursor: 'pointer',
+            }}
+          >
+            +
+          </button>
+        )}
+
+        {tile && (
+          <>
+            {tile.viewHandle && <VideoCanvas viewHandle={tile.viewHandle} />}
+            {!tile.viewHandle && !tile.error && (
+              <Centered>
+                <span style={{ color: theme.textMuted, fontSize: '12px' }}>Connecting…</span>
+              </Centered>
+            )}
+            {tile.error && (
+              <Centered>
+                <span style={{ color: theme.danger, fontSize: '11.5px', textAlign: 'center', padding: '0 1rem' }}>
+                  {tile.error}
+                </span>
+              </Centered>
+            )}
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '0.3rem 0.5rem',
+                background: 'linear-gradient(rgba(0,0,0,0.6), transparent)',
+                fontSize: '11px',
+                color: '#fff',
+              }}
+            >
+              <span>
+                {tile.deviceName} · ch{tile.channel}
+                {isExpanded && (
+                  <span style={{ color: 'rgba(255,255,255,0.6)', marginLeft: '0.4rem' }}>
+                    (double-click to restore)
+                  </span>
+                )}
+              </span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  clearTile(i);
+                }}
+                style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '13px' }}
+              >
+                &times;
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div style={{ height: '100%', display: 'flex' }}>
@@ -221,6 +421,16 @@ export function LiveView() {
               <span style={{ color: theme.textFaint, fontSize: '10px', width: '10px' }}>
                 {expandedDeviceId === device.id ? '▾' : '▸'}
               </span>
+              <span
+                title={statusLabel(statusById[device.id])}
+                style={{
+                  width: '7px',
+                  height: '7px',
+                  borderRadius: '50%',
+                  background: statusColor(statusById[device.id]),
+                  flexShrink: 0,
+                }}
+              />
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {device.name}
               </span>
@@ -261,8 +471,8 @@ export function LiveView() {
                         JSON.stringify({ type: 'channel', deviceId: device.id, channel: ch.channel }),
                       )
                     }
-                    onClick={() => assignToFirstEmptyTile(device.id, ch.channel)}
-                    title="Click to play in the next open tile · drag onto a tile to place it there"
+                    onClick={() => assignToSelectedOrFirstEmptyTile(device.id, ch.channel)}
+                    title="Click to play in the selected tile (or the next open one) · drag onto a tile to place it there"
                     style={{
                       padding: '0.3rem 0.5rem',
                       borderRadius: '4px',
@@ -285,114 +495,87 @@ export function LiveView() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         <div
           style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.4rem',
-            padding: '0.6rem 0.9rem',
-            borderBottom: `1px solid ${theme.border}`,
-          }}
-        >
-          <span style={{ fontSize: '11.5px', color: theme.textMuted, marginRight: '0.3rem' }}>Layout</span>
-          {LAYOUTS.map((n) => (
-            <button
-              key={n}
-              onClick={() => changeLayout(n)}
-              style={{
-                padding: '0.3rem 0.6rem',
-                borderRadius: '4px',
-                border: `1px solid ${n === layout ? theme.accent : theme.border}`,
-                background: n === layout ? `${theme.accent}1f` : 'transparent',
-                color: n === layout ? theme.accentHover : theme.textMuted,
-                fontSize: '11.5px',
-                cursor: 'pointer',
-              }}
-            >
-              {n}
-            </button>
-          ))}
-        </div>
-
-        <div
-          style={{
             flex: 1,
+            minHeight: 0,
             display: 'grid',
-            gridTemplateColumns: `repeat(${columns}, 1fr)`,
+            gridTemplateColumns: `repeat(${gridColumns}, 1fr)`,
+            // Without this, rows sized themselves to each canvas's actual
+            // decoded pixel height (e.g. 1080px) instead of splitting the
+            // container height evenly - confirmed live: a 16-channel grid
+            // only ever showed 3 of its 4 rows, with the rest of the window
+            // left blank below it, even maximized.
+            gridTemplateRows: `repeat(${gridRows}, 1fr)`,
             gap: '2px',
             background: theme.border,
             overflow: 'hidden',
           }}
         >
-          {Array.from({ length: layout }).map((_, i) => {
-            const tile = tiles[i];
-            return (
-              <div
-                key={i}
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={(e) => handleTileDrop(i, e)}
-                style={{ position: 'relative', background: '#000', minHeight: 0 }}
-              >
-                {!tile && (
-                  <button
-                    onClick={() => setAssigning(i)}
-                    style={{
-                      width: '100%',
-                      height: '100%',
-                      border: 'none',
-                      background: 'transparent',
-                      color: theme.textFaint,
-                      fontSize: '26px',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    +
-                  </button>
-                )}
+          {displayIndices.map((i) => renderTile(i))}
+        </div>
 
-                {tile && (
-                  <>
-                    {tile.viewHandle && <VideoCanvas viewHandle={tile.viewHandle} />}
-                    {!tile.viewHandle && !tile.error && (
-                      <Centered>
-                        <span style={{ color: theme.textMuted, fontSize: '12px' }}>Connecting…</span>
-                      </Centered>
-                    )}
-                    {tile.error && (
-                      <Centered>
-                        <span style={{ color: theme.danger, fontSize: '11.5px', textAlign: 'center', padding: '0 1rem' }}>
-                          {tile.error}
-                        </span>
-                      </Centered>
-                    )}
-                    <div
-                      style={{
-                        position: 'absolute',
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        padding: '0.3rem 0.5rem',
-                        background: 'linear-gradient(rgba(0,0,0,0.6), transparent)',
-                        fontSize: '11px',
-                        color: '#fff',
-                      }}
-                    >
-                      <span>
-                        {tile.deviceName} · ch{tile.channel}
-                      </span>
-                      <button
-                        onClick={() => clearTile(i)}
-                        style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '13px' }}
-                      >
-                        &times;
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            );
-          })}
+        {/* Toolbar for grid layout + per-channel tools (audio, snapshot,
+            etc. get added here as they're built) + live host resource
+            usage, at the bottom of the page rather than a dedicated top
+            row — leaves the top of the page free for the video itself and
+            groups everything that acts on "the grid as a whole" in one
+            place. */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.35rem',
+            padding: '0.45rem 0.75rem',
+            borderTop: `1px solid ${theme.border}`,
+            background: theme.panel,
+            flexShrink: 0,
+          }}
+        >
+          <div style={{ display: 'flex', gap: '0.3rem' }}>
+            {LAYOUTS.map((n) => (
+              <button
+                key={n}
+                title={`${n === 1 ? 'Single' : `${n}-channel`} layout`}
+                onClick={() => changeLayout(n)}
+                style={{
+                  width: '26px',
+                  height: '26px',
+                  borderRadius: '4px',
+                  border: `1px solid ${n === layout ? theme.accent : theme.border}`,
+                  background: n === layout ? `${theme.accent}1f` : 'transparent',
+                  color: n === layout ? theme.accentHover : theme.textMuted,
+                  fontSize: '11.5px',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ width: '1px', alignSelf: 'stretch', margin: '0.2rem 0.35rem', background: theme.border }} />
+
+          <ToolbarIconButton title="Audio — coming soon" disabled>
+            &#128266;
+          </ToolbarIconButton>
+          <ToolbarIconButton title="Snapshot — coming soon" disabled>
+            &#128247;
+          </ToolbarIconButton>
+
+          <div style={{ flex: 1 }} />
+
+          <span style={{ fontSize: '11px', color: theme.textFaint, display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+            CPU
+            <strong style={{ color: theme.textMuted, fontWeight: 600 }}>
+              {stats ? `${stats.cpuPercent}%` : '—'}
+            </strong>
+          </span>
+          <span style={{ fontSize: '11px', color: theme.textFaint, display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+            Memory
+            <strong style={{ color: theme.textMuted, fontWeight: 600 }}>
+              {stats ? `${stats.memPercent}%` : '—'}
+            </strong>
+          </span>
         </div>
       </div>
 
@@ -407,10 +590,63 @@ export function LiveView() {
   );
 }
 
+function statusColor(status: DeviceConnectionStatus | undefined): string {
+  if (!status || status.state === 'connecting') return theme.warning;
+  return status.state === 'online' ? theme.success : theme.danger;
+}
+
+function statusLabel(status: DeviceConnectionStatus | undefined): string {
+  if (!status || status.state === 'connecting') return 'Connecting…';
+  return status.state === 'online' ? 'Online' : `Offline — ${status.error}`;
+}
+
 function Centered({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       {children}
     </div>
+  );
+}
+
+function ToolbarIconButton({
+  title,
+  disabled,
+  onClick,
+  children,
+}: {
+  title: string;
+  disabled?: boolean;
+  onClick?: () => void;
+  children: ReactNode;
+}) {
+  const style: CSSProperties = {
+    width: '26px',
+    height: '26px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: '4px',
+    border: 'none',
+    background: 'none',
+    color: disabled ? theme.textFaint : theme.textMuted,
+    fontSize: '13px',
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.5 : 1,
+  };
+  return (
+    <button
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      style={style}
+      onMouseEnter={(e) => {
+        if (!disabled) e.currentTarget.style.color = theme.text;
+      }}
+      onMouseLeave={(e) => {
+        if (!disabled) e.currentTarget.style.color = theme.textMuted;
+      }}
+    >
+      {children}
+    </button>
   );
 }

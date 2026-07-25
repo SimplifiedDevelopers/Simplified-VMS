@@ -6,6 +6,7 @@
 // this is what makes painting into an HTML canvas possible at all.
 #include <napi.h>
 #include <windows.h>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,24 @@ std::mutex g_mutex;
 // can only identify its session via the decode port number it was given.
 std::unordered_map<long, LiveViewSession*> g_sessionsByPort;
 std::unordered_map<long, LiveViewSession*> g_sessionsByHandle;
+
+// See the matching note in native/uniview/src/addon.cc. Scoped PER SESSION
+// (keyed by lUserID), not global — a global mutex was tried first and, on
+// Uniview, turned a single hung RealPlay call on one device into a
+// permanent freeze of every other device sharing that addon. Login itself
+// is intentionally NOT serialized by any mutex — different devices logging
+// in concurrently is normal, expected usage, and the JS side
+// (main/ipc/liveView.ts) already dedupes concurrent logins for the SAME
+// device.
+std::mutex g_sdkMutexMapGuard;
+std::unordered_map<long, std::unique_ptr<std::mutex>> g_sdkMutexBySession;
+
+std::mutex& SdkMutexForSession(long lUserID) {
+  std::lock_guard<std::mutex> lock(g_sdkMutexMapGuard);
+  auto& slot = g_sdkMutexBySession[lUserID];
+  if (!slot) slot = std::make_unique<std::mutex>();
+  return *slot;
+}
 
 struct FrameData {
   int width = 0;
@@ -150,6 +169,77 @@ void DestroySession(LiveViewSession* session) {
 
 }  // namespace
 
+// Login and StartLiveView both do a real blocking network handshake
+// (NET_DVR_Login_V40/NET_DVR_RealPlay_V40 can take seconds on a slow link) -
+// running them directly on the N-API call thread means the calling thread
+// (Electron's main/UI thread) is frozen for the duration. Confirmed live:
+// a slow-connecting device froze the entire app, not just the dialog that
+// triggered the login. AsyncWorker moves the actual SDK call onto a libuv
+// worker thread; OnOK/OnError resolve the real Promise back on the main
+// thread once it's done.
+class LoginWorker : public Napi::AsyncWorker {
+ public:
+  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password)
+      : Napi::AsyncWorker(env),
+        host_(std::move(host)),
+        port_(port),
+        username_(std::move(username)),
+        password_(std::move(password)),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    NET_DVR_USER_LOGIN_INFO loginInfo = {};
+    strncpy_s(loginInfo.sDeviceAddress, host_.c_str(), _TRUNCATE);
+    loginInfo.wPort = static_cast<WORD>(port_);
+    strncpy_s(loginInfo.sUserName, username_.c_str(), _TRUNCATE);
+    strncpy_s(loginInfo.sPassword, password_.c_str(), _TRUNCATE);
+    loginInfo.bUseAsynLogin = FALSE;
+
+    lUserID_ = NET_DVR_Login_V40(&loginInfo, &deviceInfo_);
+    if (lUserID_ < 0) {
+      const DWORD err = NET_DVR_GetLastError();
+      SetError("Hikvision login failed (NET_DVR error " + std::to_string(err) + ")");
+    }
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    const auto& dev = deviceInfo_.struDeviceV30;
+
+    // Hybrid/NVR devices number analog and digital(IP) channels in two
+    // separate ranges — confirmed against real hardware: a pure-IP
+    // 16-channel NVR rejected channel 1 (NET_DVR_CHANNEL_ERROR) and only
+    // accepted channels starting at byStartDChan (33 on that unit).
+    // Building the explicit channel list here (rather than exposing
+    // start/count and computing it downstream) keeps the shared
+    // DeviceSession shape vendor-agnostic — Uniview's channel IDs aren't a
+    // predictable contiguous range at all, so a per-vendor range formula
+    // doesn't generalize.
+    Napi::Array channels = Napi::Array::New(env);
+    uint32_t idx = 0;
+    for (int i = 0; i < dev.byChanNum; ++i) channels[idx++] = Napi::Number::New(env, dev.byStartChan + i);
+    for (int i = 0; i < dev.byIPChanNum; ++i) channels[idx++] = Napi::Number::New(env, dev.byStartDChan + i);
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("sessionId", std::to_string(lUserID_));
+    result.Set("channels", channels);
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  std::string host_;
+  int port_;
+  std::string username_;
+  std::string password_;
+  Napi::Promise::Deferred deferred_;
+  LONG lUserID_ = -1;
+  NET_DVR_DEVICEINFO_V40 deviceInfo_ = {};
+};
+
 Napi::Value Login(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsObject()) {
@@ -157,46 +247,15 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   Napi::Object params = info[0].As<Napi::Object>();
-  const std::string host = params.Get("host").As<Napi::String>().Utf8Value();
+  std::string host = params.Get("host").As<Napi::String>().Utf8Value();
   const int port = params.Get("port").As<Napi::Number>().Int32Value();
-  const std::string username = params.Get("username").As<Napi::String>().Utf8Value();
-  const std::string password = params.Get("password").As<Napi::String>().Utf8Value();
+  std::string username = params.Get("username").As<Napi::String>().Utf8Value();
+  std::string password = params.Get("password").As<Napi::String>().Utf8Value();
 
-  NET_DVR_USER_LOGIN_INFO loginInfo = {};
-  strncpy_s(loginInfo.sDeviceAddress, host.c_str(), _TRUNCATE);
-  loginInfo.wPort = static_cast<WORD>(port);
-  strncpy_s(loginInfo.sUserName, username.c_str(), _TRUNCATE);
-  strncpy_s(loginInfo.sPassword, password.c_str(), _TRUNCATE);
-  loginInfo.bUseAsynLogin = FALSE;
-
-  NET_DVR_DEVICEINFO_V40 deviceInfo = {};
-  const LONG lUserID = NET_DVR_Login_V40(&loginInfo, &deviceInfo);
-  if (lUserID < 0) {
-    const DWORD err = NET_DVR_GetLastError();
-    Napi::Error::New(env, "Hikvision login failed (NET_DVR error " + std::to_string(err) + ")")
-        .ThrowAsJavaScriptException();
-    return env.Null();
-  }
-
-  const auto& dev = deviceInfo.struDeviceV30;
-
-  // Hybrid/NVR devices number analog and digital(IP) channels in two
-  // separate ranges — confirmed against real hardware: a pure-IP 16-channel
-  // NVR rejected channel 1 (NET_DVR_CHANNEL_ERROR) and only accepted
-  // channels starting at byStartDChan (33 on that unit). Building the
-  // explicit channel list here (rather than exposing start/count and
-  // computing it downstream) keeps the shared DeviceSession shape vendor-
-  // agnostic — Uniview's channel IDs aren't a predictable contiguous range
-  // at all, so a per-vendor range formula doesn't generalize.
-  Napi::Array channels = Napi::Array::New(env);
-  uint32_t idx = 0;
-  for (int i = 0; i < dev.byChanNum; ++i) channels[idx++] = Napi::Number::New(env, dev.byStartChan + i);
-  for (int i = 0; i < dev.byIPChanNum; ++i) channels[idx++] = Napi::Number::New(env, dev.byStartDChan + i);
-
-  Napi::Object result = Napi::Object::New(env);
-  result.Set("sessionId", std::to_string(lUserID));
-  result.Set("channels", channels);
-  return result;
+  auto* worker = new LoginWorker(env, std::move(host), port, std::move(username), std::move(password));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value Logout(const Napi::CallbackInfo& info) {
@@ -206,6 +265,72 @@ Napi::Value Logout(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+class StartLiveViewWorker : public Napi::AsyncWorker {
+ public:
+  StartLiveViewWorker(Napi::Env env, long lUserID, int channel, std::string streamType, Napi::ThreadSafeFunction tsfn)
+      : Napi::AsyncWorker(env),
+        channel_(channel),
+        streamType_(std::move(streamType)),
+        deferred_(Napi::Promise::Deferred::New(env)) {
+    session_ = new LiveViewSession();
+    session_->lUserID = lUserID;
+    session_->tsfn = std::move(tsfn);
+  }
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+
+    LONG nPort = -1;
+    if (!PlayM4_GetPort(&nPort)) {
+      session_->tsfn.Release();
+      delete session_;
+      session_ = nullptr;
+      SetError("PlayM4_GetPort failed");
+      return;
+    }
+    session_->nPort = nPort;
+
+    NET_DVR_PREVIEWINFO previewInfo = {};
+    previewInfo.lChannel = channel_;
+    previewInfo.dwStreamType = (streamType_ == "sub") ? 1 : 0;
+    previewInfo.dwLinkMode = 0;  // TCP
+    previewInfo.hPlayWnd = nullptr;
+    previewInfo.bBlocked = 1;
+    previewInfo.byProtoType = 0;
+    previewInfo.dwDisplayBufNum = 1;
+
+    const LONG lRealHandle = NET_DVR_RealPlay_V40(session_->lUserID, &previewInfo, OnRawData, session_);
+    if (lRealHandle < 0) {
+      const DWORD err = NET_DVR_GetLastError();
+      session_->tsfn.Release();
+      PlayM4_FreePort(nPort);
+      delete session_;
+      session_ = nullptr;
+      SetError("NET_DVR_RealPlay_V40 failed (NET_DVR error " + std::to_string(err) + ")");
+      return;
+    }
+    session_->lRealHandle = lRealHandle;
+    lRealHandle_ = lRealHandle;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_sessionsByPort[nPort] = session_;
+    g_sessionsByHandle[lRealHandle] = session_;
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(lRealHandle_))); }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  int channel_;
+  std::string streamType_;
+  LiveViewSession* session_ = nullptr;
+  LONG lRealHandle_ = -1;
+  Napi::Promise::Deferred deferred_;
+};
+
 Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
@@ -214,46 +339,12 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Function onFrame = info[3].As<Napi::Function>();
 
   const long lUserID = std::stol(sessionId);
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "hikvision-frame-callback", 0, 1);
 
-  LONG nPort = -1;
-  if (!PlayM4_GetPort(&nPort)) {
-    Napi::Error::New(env, "PlayM4_GetPort failed").ThrowAsJavaScriptException();
-    return env.Null();
-  }
-
-  auto* session = new LiveViewSession();
-  session->lUserID = lUserID;
-  session->nPort = nPort;
-  session->tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "hikvision-frame-callback", 0, 1);
-
-  NET_DVR_PREVIEWINFO previewInfo = {};
-  previewInfo.lChannel = channel;
-  previewInfo.dwStreamType = (streamType == "sub") ? 1 : 0;
-  previewInfo.dwLinkMode = 0;  // TCP
-  previewInfo.hPlayWnd = nullptr;
-  previewInfo.bBlocked = 1;
-  previewInfo.byProtoType = 0;
-  previewInfo.dwDisplayBufNum = 1;
-
-  const LONG lRealHandle = NET_DVR_RealPlay_V40(lUserID, &previewInfo, OnRawData, session);
-  if (lRealHandle < 0) {
-    const DWORD err = NET_DVR_GetLastError();
-    session->tsfn.Release();
-    PlayM4_FreePort(nPort);
-    delete session;
-    Napi::Error::New(env, "NET_DVR_RealPlay_V40 failed (NET_DVR error " + std::to_string(err) + ")")
-        .ThrowAsJavaScriptException();
-    return env.Null();
-  }
-  session->lRealHandle = lRealHandle;
-
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_sessionsByPort[nPort] = session;
-    g_sessionsByHandle[lRealHandle] = session;
-  }
-
-  return Napi::String::New(env, std::to_string(lRealHandle));
+  auto* worker = new StartLiveViewWorker(env, lUserID, channel, streamType, std::move(tsfn));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {

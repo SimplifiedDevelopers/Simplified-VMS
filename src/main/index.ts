@@ -2,10 +2,12 @@ import { join } from 'path';
 import { app, BrowserWindow, shell } from 'electron';
 import { registerAuthIpcHandlers } from './ipc/auth';
 import { registerDeviceIpcHandlers } from './ipc/devices';
-import { logoutAllSessions, registerLiveViewIpcHandlers } from './ipc/liveView';
+import { registerLiveViewIpcHandlers } from './ipc/liveView';
 import { registerPrefsIpcHandlers } from './ipc/prefs';
 import { registerSettingsIpcHandlers } from './ipc/settings';
 import { registerSystemIpcHandlers } from './ipc/system';
+import { connectAll, disconnectAll, onStatusChange, startHeartbeat } from './services/connectionManager';
+import { startStatsBroadcast } from './services/systemStats';
 import { readSettings } from './store/settingsStore';
 
 // disableHardwareAcceleration() must run before app.whenReady() and can't be
@@ -59,6 +61,21 @@ app.whenReady().then(() => {
   registerSystemIpcHandlers();
   createWindow();
 
+  // Every configured DVR/NVR connects once here and stays connected for the
+  // app's whole lifetime — matches how every other VMS the team has used
+  // behaves, and fixes a real complaint: Device Management and Live View
+  // previously only ever logged in on demand, so switching between pages
+  // (or even just re-opening Device Management) meant reconnecting to every
+  // device from scratch each time.
+  connectAll();
+  startHeartbeat();
+  onStatusChange((deviceId, status) => {
+    mainWindow?.webContents.send('devices:statusChanged', deviceId, status);
+  });
+  startStatsBroadcast((stats) => {
+    mainWindow?.webContents.send('system:stats', stats);
+  });
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -73,5 +90,5 @@ app.on('before-quit', (event) => {
   if (quitting) return;
   event.preventDefault();
   quitting = true;
-  logoutAllSessions().finally(() => app.quit());
+  disconnectAll().finally(() => app.quit());
 });

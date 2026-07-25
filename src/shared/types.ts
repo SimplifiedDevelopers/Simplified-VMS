@@ -21,6 +21,15 @@ export interface LoginParams {
   port: number;
   username: string;
   password: string;
+  // Uniview-specific hint (other vendors ignore it): Uniview's login call
+  // (NETDEV_Login_V30) doesn't return channel info at all, unlike
+  // Hikvision/Dahua/TVT whose login calls return it directly — it needs a
+  // second network round trip (NETDEV_QueryVideoChlDetailListEx) just to
+  // learn the channel list, roughly doubling connect time. Set this when
+  // the caller already knows the channel list (or doesn't need it at all,
+  // e.g. a pure reachability check) so that extra round trip can be
+  // skipped; `channels` on the returned DeviceSession will just be empty.
+  skipChannelQuery?: boolean;
 }
 
 export interface DeviceSession {
@@ -63,6 +72,13 @@ export interface StoredDevice {
   // to open the device's browser-based admin page ("Open" action).
   httpPort: number;
   username: string;
+  // Fetched and saved the moment the device is added (or first
+  // successfully connected to) so that browsing the Live View device list
+  // never has to log in and query the device just to show its channel
+  // list — every other VMS the team has used treats this as static,
+  // rarely-changing data, not something to re-fetch on every click. Empty
+  // until the first successful login populates it.
+  channels: number[];
 }
 
 export interface NewDeviceInput {
@@ -94,10 +110,30 @@ export interface AppSettings {
 }
 
 // Result of a login+immediate-logout probe — doesn't persist a session,
-// used both to test connectivity before saving a device and to show
-// online/offline status for already-saved ones.
+// used only to test connectivity for a device before it's saved (the
+// device doesn't exist in the store yet, so there's nothing to keep
+// connected). Already-saved devices get their live status from
+// DeviceConnectionStatus instead (see below).
 export interface ConnectionTestResult {
   ok: boolean;
   channelCount?: number;
   error?: string;
+}
+
+// Live status of a saved device's persistent connection, owned by the main
+// process's connectionManager — every saved device connects once when the
+// app opens and stays connected until it closes, so this reflects a real
+// standing session rather than a fresh probe.
+export type DeviceConnectionStatus =
+  | { state: 'connecting' }
+  | { state: 'online'; channels: number[] }
+  | { state: 'offline'; error: string };
+
+// Host machine resource usage, shown in the Live View toolbar so the user
+// can see whether the machine is under strain from decoding many channels
+// at once — sampled in the main process (Node's os module) and pushed to
+// the renderer periodically.
+export interface SystemStats {
+  cpuPercent: number;
+  memPercent: number;
 }

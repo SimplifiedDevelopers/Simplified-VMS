@@ -12,14 +12,19 @@ interface NativeFrame {
 }
 
 interface NativeAddon {
-  login(params: LoginParams): DeviceSession;
+  // login/startLiveView run on a libuv worker thread (Napi::AsyncWorker) and
+  // return real Promises — the SDK's own login/connect calls can block for
+  // seconds on a slow link, and running them on the N-API call thread
+  // directly freezes Electron's main/UI thread for that whole time
+  // (confirmed live against a real device).
+  login(params: LoginParams): Promise<DeviceSession>;
   logout(sessionId: string): void;
   startLiveView(
     sessionId: string,
     channel: number,
     streamType: StreamType,
     onFrame: (frame: NativeFrame) => void,
-  ): string;
+  ): Promise<string>;
   stopLiveView(viewHandle: string): void;
 }
 

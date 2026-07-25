@@ -107,10 +107,21 @@ export function AppShell({ onLoggedOut }: Props) {
       </div>
 
       <div style={{ flex: 1, overflow: 'auto', position: 'relative' }}>
-        {activeTab === 'controlPanel' && <ControlPanel onOpen={openTab} />}
-        {activeTab === 'liveView' && <LiveView />}
-        {activeTab === 'playback' && <Playback />}
-        {activeTab === 'deviceManagement' && <DeviceManagement />}
+        {/* Every opened tab stays mounted (just hidden) instead of being
+            swapped out — unmounting Live View on every tab switch was
+            tearing down its live sessions (its cleanup effect stops every
+            playing tile) and losing its tiles/layout state, confirmed live:
+            navigating away and back always lost whatever was playing.
+            Closing a tab (closeTab) still actually unmounts it, which is
+            the one case where tearing down its sessions is correct. */}
+        {openTabs.map((tab) => (
+          <div key={tab} style={{ display: activeTab === tab ? 'block' : 'none', height: '100%' }}>
+            {tab === 'controlPanel' && <ControlPanel onOpen={openTab} />}
+            {tab === 'liveView' && <LiveView />}
+            {tab === 'playback' && <Playback />}
+            {tab === 'deviceManagement' && <DeviceManagement />}
+          </div>
+        ))}
       </div>
 
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}

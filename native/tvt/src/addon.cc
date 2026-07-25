@@ -16,6 +16,7 @@
 #include <napi.h>
 #include <windows.h>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -33,6 +34,24 @@ struct LiveViewSession {
 
 std::mutex g_mutex;
 std::unordered_map<POINTERHANDLE, LiveViewSession*> g_sessionsByHandle;
+
+// See the matching note in native/uniview/src/addon.cc. Scoped PER SESSION
+// (keyed by lUserID), not global — a global mutex was tried first and, on
+// Uniview, turned a single hung LivePlay call on one device into a
+// permanent freeze of every other device sharing that addon. Login itself
+// is intentionally NOT serialized by any mutex — different devices logging
+// in concurrently is normal, expected usage, and the JS side
+// (main/ipc/liveView.ts) already dedupes concurrent logins for the SAME
+// device.
+std::mutex g_sdkMutexMapGuard;
+std::unordered_map<LONG, std::unique_ptr<std::mutex>> g_sdkMutexBySession;
+
+std::mutex& SdkMutexForSession(LONG lUserID) {
+  std::lock_guard<std::mutex> lock(g_sdkMutexMapGuard);
+  auto& slot = g_sdkMutexBySession[lUserID];
+  if (!slot) slot = std::make_unique<std::mutex>();
+  return *slot;
+}
 
 struct FrameData {
   int width = 0;
@@ -110,6 +129,57 @@ void DestroySession(LiveViewSession* session) {
 
 }  // namespace
 
+// See the note above g_sdkMutexBySession for why login/startLiveView run off
+// the main thread, and why login is not serialized by any mutex here.
+class LoginWorker : public Napi::AsyncWorker {
+ public:
+  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password)
+      : Napi::AsyncWorker(env),
+        host_(std::move(host)),
+        port_(port),
+        username_(std::move(username)),
+        password_(std::move(password)),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    NET_SDK_DEVICEINFO deviceInfo = {};
+    lUserID_ = NET_SDK_Login(&host_[0], static_cast<WORD>(port_), &username_[0], &password_[0], &deviceInfo);
+    if (lUserID_ < 0) {
+      const DWORD err = NET_SDK_GetLastError();
+      SetError("TVT login failed (error " + std::to_string(err) + ")");
+      return;
+    }
+    channelCount_ = deviceInfo.videoInputNum;
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    // Channels are documented as 0-based (NET_SDK_CLIENTINFO.lChannel comment).
+    Napi::Array channels = Napi::Array::New(env);
+    for (int i = 0; i < channelCount_; ++i) {
+      channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);
+    }
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("sessionId", std::to_string(lUserID_));
+    result.Set("channels", channels);
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  std::string host_;
+  int port_;
+  std::string username_;
+  std::string password_;
+  Napi::Promise::Deferred deferred_;
+  LONG lUserID_ = -1;
+  int channelCount_ = 0;
+};
+
 Napi::Value Login(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsObject()) {
@@ -122,25 +192,10 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
   std::string username = params.Get("username").As<Napi::String>().Utf8Value();
   std::string password = params.Get("password").As<Napi::String>().Utf8Value();
 
-  NET_SDK_DEVICEINFO deviceInfo = {};
-  const LONG lUserID = NET_SDK_Login(&host[0], static_cast<WORD>(port), &username[0], &password[0], &deviceInfo);
-  if (lUserID < 0) {
-    const DWORD err = NET_SDK_GetLastError();
-    Napi::Error::New(env, "TVT login failed (error " + std::to_string(err) + ")").ThrowAsJavaScriptException();
-    return env.Null();
-  }
-
-  // Channels are documented as 0-based (NET_SDK_CLIENTINFO.lChannel comment).
-  const int channelCount = deviceInfo.videoInputNum;
-  Napi::Array channels = Napi::Array::New(env);
-  for (int i = 0; i < channelCount; ++i) {
-    channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);
-  }
-
-  Napi::Object result = Napi::Object::New(env);
-  result.Set("sessionId", std::to_string(lUserID));
-  result.Set("channels", channels);
-  return result;
+  auto* worker = new LoginWorker(env, std::move(host), port, std::move(username), std::move(password));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value Logout(const Napi::CallbackInfo& info) {
@@ -150,6 +205,64 @@ Napi::Value Logout(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+class StartLiveViewWorker : public Napi::AsyncWorker {
+ public:
+  StartLiveViewWorker(Napi::Env env, LONG lUserID, int channel, std::string streamType,
+                       Napi::ThreadSafeFunction tsfn)
+      : Napi::AsyncWorker(env), channel_(channel), streamType_(std::move(streamType)),
+        deferred_(Napi::Promise::Deferred::New(env)) {
+    session_ = new LiveViewSession();
+    session_->lUserID = lUserID;
+    session_->tsfn = std::move(tsfn);
+  }
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+
+    NET_SDK_CLIENTINFO clientInfo = {};
+    clientInfo.lChannel = channel_;
+    clientInfo.streamType = (streamType_ == "sub") ? NET_SDK_SUB_STREAM : NET_SDK_MAIN_STREAM;
+    clientInfo.hPlayWnd = nullptr;
+    clientInfo.bNoDecode = 0;  // 0 = decode - required for the YUV callback to receive real data.
+
+    const POINTERHANDLE lLiveHandle = NET_SDK_LivePlay(session_->lUserID, &clientInfo, nullptr, nullptr);
+    if (lLiveHandle == -1) {
+      const DWORD err = NET_SDK_GetLastError();
+      session_->tsfn.Release();
+      delete session_;
+      session_ = nullptr;
+      SetError("NET_SDK_LivePlay failed (error " + std::to_string(err) + ")");
+      return;
+    }
+    session_->lLiveHandle = lLiveHandle;
+    lLiveHandle_ = lLiveHandle;
+
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_sessionsByHandle[lLiveHandle] = session_;
+    }
+
+    // pUser is passed straight through to OnYUVFrame - no separate lookup
+    // table needed for frame dispatch (unlike Hikvision/Uniview's callbacks,
+    // which lack a per-registration user pointer). Still keeping the handle
+    // map above for StopLiveView's cleanup path.
+    NET_SDK_SetYUVCallBack(lLiveHandle, OnYUVFrame, session_);
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(lLiveHandle_))); }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  int channel_;
+  std::string streamType_;
+  LiveViewSession* session_ = nullptr;
+  POINTERHANDLE lLiveHandle_ = -1;
+  Napi::Promise::Deferred deferred_;
+};
+
 Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
@@ -158,39 +271,12 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Function onFrame = info[3].As<Napi::Function>();
 
   const LONG lUserID = std::stol(sessionId);
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-frame-callback", 0, 1);
 
-  auto* session = new LiveViewSession();
-  session->lUserID = lUserID;
-  session->tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-frame-callback", 0, 1);
-
-  NET_SDK_CLIENTINFO clientInfo = {};
-  clientInfo.lChannel = channel;
-  clientInfo.streamType = (streamType == "sub") ? NET_SDK_SUB_STREAM : NET_SDK_MAIN_STREAM;
-  clientInfo.hPlayWnd = nullptr;
-  clientInfo.bNoDecode = 0;  // 0 = decode - required for the YUV callback to receive real data.
-
-  const POINTERHANDLE lLiveHandle = NET_SDK_LivePlay(lUserID, &clientInfo, nullptr, nullptr);
-  if (lLiveHandle == -1) {
-    const DWORD err = NET_SDK_GetLastError();
-    session->tsfn.Release();
-    delete session;
-    Napi::Error::New(env, "NET_SDK_LivePlay failed (error " + std::to_string(err) + ")").ThrowAsJavaScriptException();
-    return env.Null();
-  }
-  session->lLiveHandle = lLiveHandle;
-
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_sessionsByHandle[lLiveHandle] = session;
-  }
-
-  // pUser is passed straight through to OnYUVFrame - no separate lookup
-  // table needed for frame dispatch (unlike Hikvision/Uniview's callbacks,
-  // which lack a per-registration user pointer). Still keeping the handle
-  // map above for StopLiveView's cleanup path.
-  NET_SDK_SetYUVCallBack(lLiveHandle, OnYUVFrame, session);
-
-  return Napi::String::New(env, std::to_string(lLiveHandle));
+  auto* worker = new StartLiveViewWorker(env, lUserID, channel, streamType, std::move(tsfn));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {

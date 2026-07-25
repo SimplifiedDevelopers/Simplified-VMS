@@ -6,6 +6,7 @@
 // identified by lLoginID/lPlayHandle. No separate decode library needed.
 #include <napi.h>
 #include <windows.h>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,26 @@ struct LiveViewSession {
 
 std::mutex g_mutex;
 std::unordered_map<LLONG, LiveViewSession*> g_sessionsByHandle;
+
+// See the matching note in native/uniview/src/addon.cc. Scoped PER SESSION
+// (keyed by lLoginID), not global — a global mutex was tried first and,
+// on Uniview, turned a single hung RealPlay call on one device into a
+// permanent freeze of every other device sharing that addon, since nothing
+// else could ever enter the SDK again. Keying per-session means a stuck
+// call only ever blocks further calls against that same device's session.
+// Login itself is intentionally NOT serialized by any mutex — different
+// devices logging in concurrently is normal, expected usage, and the JS
+// side (main/ipc/liveView.ts) already dedupes concurrent logins for the
+// SAME device.
+std::mutex g_sdkMutexMapGuard;
+std::unordered_map<LLONG, std::unique_ptr<std::mutex>> g_sdkMutexBySession;
+
+std::mutex& SdkMutexForSession(LLONG lLoginID) {
+  std::lock_guard<std::mutex> lock(g_sdkMutexMapGuard);
+  auto& slot = g_sdkMutexBySession[lLoginID];
+  if (!slot) slot = std::make_unique<std::mutex>();
+  return *slot;
+}
 
 struct FrameData {
   int width = 0;
@@ -130,6 +151,68 @@ HWND GetOrCreateHiddenWindow() {
 
 }  // namespace
 
+// See the note above g_sdkMutexBySession for why login/startLiveView run off
+// the main thread, and why login is not serialized by any mutex here.
+class LoginWorker : public Napi::AsyncWorker {
+ public:
+  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password)
+      : Napi::AsyncWorker(env),
+        host_(std::move(host)),
+        port_(port),
+        username_(std::move(username)),
+        password_(std::move(password)),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    // CLIENT_LoginWithHighLevelSecurity (the newer handshake) timed out
+    // against a real fleet device with confirmed-correct credentials on a
+    // confirmed-reachable port - some older/rebranded Dahua-family units
+    // don't support it at all and silently drop the attempt instead of
+    // rejecting it cleanly, which looks identical to a network timeout.
+    // CLIENT_LoginEx2 is the older, far more universally supported login
+    // call and is what actually worked.
+    NET_DEVICEINFO_Ex deviceInfo = {};
+    int error = 0;
+    lLoginID_ = CLIENT_LoginEx2(host_.c_str(), static_cast<WORD>(port_), username_.c_str(), password_.c_str(),
+                                 EM_LOGIN_SPEC_CAP_TCP, nullptr, &deviceInfo, &error);
+    if (lLoginID_ == 0) {
+      SetError("Dahua login failed (error " + std::to_string(error) + ")");
+      return;
+    }
+    channelCount_ = deviceInfo.nChanNum;
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    // Dahua's device info only reports a total channel count, not per-channel
+    // IDs or a start offset (unlike Hikvision/Uniview) - Dahua's documented
+    // convention is 0-based channel indexing. Unverified against real
+    // hardware yet; adjust here if a real device rejects channel 0.
+    Napi::Array channels = Napi::Array::New(env);
+    for (int i = 0; i < channelCount_; ++i) {
+      channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);
+    }
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("sessionId", std::to_string(lLoginID_));
+    result.Set("channels", channels);
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  std::string host_;
+  int port_;
+  std::string username_;
+  std::string password_;
+  Napi::Promise::Deferred deferred_;
+  LLONG lLoginID_ = 0;
+  int channelCount_ = 0;
+};
+
 Napi::Value Login(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsObject()) {
@@ -137,41 +220,15 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   Napi::Object params = info[0].As<Napi::Object>();
-  const std::string host = params.Get("host").As<Napi::String>().Utf8Value();
+  std::string host = params.Get("host").As<Napi::String>().Utf8Value();
   const int port = params.Get("port").As<Napi::Number>().Int32Value();
-  const std::string username = params.Get("username").As<Napi::String>().Utf8Value();
-  const std::string password = params.Get("password").As<Napi::String>().Utf8Value();
+  std::string username = params.Get("username").As<Napi::String>().Utf8Value();
+  std::string password = params.Get("password").As<Napi::String>().Utf8Value();
 
-  // CLIENT_LoginWithHighLevelSecurity (the newer handshake) timed out
-  // against a real fleet device with confirmed-correct credentials on a
-  // confirmed-reachable port - some older/rebranded Dahua-family units
-  // don't support it at all and silently drop the attempt instead of
-  // rejecting it cleanly, which looks identical to a network timeout.
-  // CLIENT_LoginEx2 is the older, far more universally supported login
-  // call and is what actually worked.
-  NET_DEVICEINFO_Ex deviceInfo = {};
-  int error = 0;
-  const LLONG lLoginID = CLIENT_LoginEx2(host.c_str(), static_cast<WORD>(port), username.c_str(), password.c_str(),
-                                          EM_LOGIN_SPEC_CAP_TCP, nullptr, &deviceInfo, &error);
-  if (lLoginID == 0) {
-    Napi::Error::New(env, "Dahua login failed (error " + std::to_string(error) + ")").ThrowAsJavaScriptException();
-    return env.Null();
-  }
-
-  // Dahua's device info only reports a total channel count, not per-channel
-  // IDs or a start offset (unlike Hikvision/Uniview) - Dahua's documented
-  // convention is 0-based channel indexing. Unverified against real
-  // hardware yet; adjust here if a real device rejects channel 0.
-  const int channelCount = deviceInfo.nChanNum;
-  Napi::Array channels = Napi::Array::New(env);
-  for (int i = 0; i < channelCount; ++i) {
-    channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);
-  }
-
-  Napi::Object result = Napi::Object::New(env);
-  result.Set("sessionId", std::to_string(lLoginID));
-  result.Set("channels", channels);
-  return result;
+  auto* worker = new LoginWorker(env, std::move(host), port, std::move(username), std::move(password));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value Logout(const Napi::CallbackInfo& info) {
@@ -181,6 +238,51 @@ Napi::Value Logout(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+class StartLiveViewWorker : public Napi::AsyncWorker {
+ public:
+  StartLiveViewWorker(Napi::Env env, LLONG lLoginID, int channel, std::string streamType,
+                       Napi::ThreadSafeFunction tsfn)
+      : Napi::AsyncWorker(env), channel_(channel), streamType_(std::move(streamType)),
+        deferred_(Napi::Promise::Deferred::New(env)) {
+    session_ = new LiveViewSession();
+    session_->lLoginID = lLoginID;
+    session_->tsfn = std::move(tsfn);
+  }
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lLoginID));
+
+    const DH_RealPlayType rType = (streamType_ == "sub") ? DH_RType_Realplay_1 : DH_RType_Realplay_0;
+    const LLONG lRealHandle = CLIENT_RealPlayEx(session_->lLoginID, channel_, GetOrCreateHiddenWindow(), rType);
+    if (lRealHandle == 0) {
+      const DWORD err = CLIENT_GetLastError();
+      session_->tsfn.Release();
+      delete session_;
+      session_ = nullptr;
+      SetError("CLIENT_RealPlayEx failed (error " + std::to_string(err) + ")");
+      return;
+    }
+    session_->lRealHandle = lRealHandle;
+    lRealHandle_ = lRealHandle;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_sessionsByHandle[lRealHandle] = session_;
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(lRealHandle_))); }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  int channel_;
+  std::string streamType_;
+  LiveViewSession* session_ = nullptr;
+  LLONG lRealHandle_ = 0;
+  Napi::Promise::Deferred deferred_;
+};
+
 Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
@@ -189,28 +291,12 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Function onFrame = info[3].As<Napi::Function>();
 
   const LLONG lLoginID = std::stoll(sessionId);
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "dahua-frame-callback", 0, 1);
 
-  auto* session = new LiveViewSession();
-  session->lLoginID = lLoginID;
-  session->tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "dahua-frame-callback", 0, 1);
-
-  const DH_RealPlayType rType = (streamType == "sub") ? DH_RType_Realplay_1 : DH_RType_Realplay_0;
-  const LLONG lRealHandle = CLIENT_RealPlayEx(lLoginID, channel, GetOrCreateHiddenWindow(), rType);
-  if (lRealHandle == 0) {
-    const DWORD err = CLIENT_GetLastError();
-    session->tsfn.Release();
-    delete session;
-    Napi::Error::New(env, "CLIENT_RealPlayEx failed (error " + std::to_string(err) + ")").ThrowAsJavaScriptException();
-    return env.Null();
-  }
-  session->lRealHandle = lRealHandle;
-
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_sessionsByHandle[lRealHandle] = session;
-  }
-
-  return Napi::String::New(env, std::to_string(lRealHandle));
+  auto* worker = new StartLiveViewWorker(env, lLoginID, channel, streamType, std::move(tsfn));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {

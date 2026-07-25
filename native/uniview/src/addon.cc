@@ -7,6 +7,7 @@
 // reverse-engineered. No separate decode library needed.
 #include <napi.h>
 #include <windows.h>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -24,6 +25,35 @@ struct LiveViewSession {
 
 std::mutex g_mutex;
 std::unordered_map<LPVOID, LiveViewSession*> g_sessionsByHandle;
+
+// Login/StartLiveView used to be accidentally serialized by running
+// synchronously on the main thread (each blocking call had to finish before
+// the next could start). Moving them to AsyncWorker lets multiple calls run
+// concurrently on libuv's thread pool - fine for the app's responsiveness,
+// but NetDEVSDK's own thread-safety for concurrent RealPlay calls against
+// the SAME session is undocumented and real hardware showed a crash/hang
+// sequence (error 102, then repeated unidentified error 60067, and at least
+// once a genuine hang where NETDEV_RealPlay_V30 never returned at all)
+// right after "play all channels" fired several startLiveView calls
+// back-to-back for one device.
+//
+// This is deliberately scoped PER SESSION (keyed by lUserID), not global.
+// A global mutex was tried first and made things worse: when
+// NETDEV_RealPlay_V30 hung for one channel on one device, the held global
+// lock permanently blocked every OTHER Uniview device in the app too
+// (confirmed live: a second, completely unrelated Uniview NVR froze right
+// after the first one got stuck) since nothing else could ever enter the
+// SDK again. Keying per-session means a stuck call only ever blocks further
+// calls against that same device's session, never sibling devices.
+std::mutex g_sdkMutexMapGuard;
+std::unordered_map<LPVOID, std::unique_ptr<std::mutex>> g_sdkMutexBySession;
+
+std::mutex& SdkMutexForSession(LPVOID lUserID) {
+  std::lock_guard<std::mutex> lock(g_sdkMutexMapGuard);
+  auto& slot = g_sdkMutexBySession[lUserID];
+  if (!slot) slot = std::make_unique<std::mutex>();
+  return *slot;
+}
 
 struct FrameData {
   int width = 0;
@@ -120,6 +150,87 @@ LPVOID IdToPointer(const std::string& id) {
 
 }  // namespace
 
+// See the AsyncWorker note above g_sdkMutexBySession for why
+// login/startLiveView run off the main thread. Login itself is NOT
+// serialized by any mutex here — different devices logging in concurrently
+// is normal, expected usage (e.g. connecting to several NVRs at once), and
+// the JS side (main/ipc/liveView.ts) already dedupes concurrent logins for
+// the SAME device via its own pendingLogins map.
+class LoginWorker : public Napi::AsyncWorker {
+ public:
+  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password,
+              bool skipChannelQuery)
+      : Napi::AsyncWorker(env),
+        host_(std::move(host)),
+        port_(port),
+        username_(std::move(username)),
+        password_(std::move(password)),
+        skipChannelQuery_(skipChannelQuery),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    NETDEV_DEVICE_LOGIN_INFO_S loginInfo = {};
+    strncpy_s(loginInfo.szIPAddr, host_.c_str(), _TRUNCATE);
+    loginInfo.dwPort = port_;
+    strncpy_s(loginInfo.szUserName, username_.c_str(), _TRUNCATE);
+    strncpy_s(loginInfo.szPassword, password_.c_str(), _TRUNCATE);
+    loginInfo.dwLoginProto = NETDEV_LOGIN_PROTO_PRIVATE;
+
+    NETDEV_SELOG_INFO_S selogInfo = {};
+    lUserID_ = NETDEV_Login_V30(&loginInfo, &selogInfo);
+    if (!lUserID_) {
+      const INT32 err = NETDEV_GetLastError();
+      SetError("Uniview login failed (NETDEV error " + std::to_string(err) + ")");
+      return;
+    }
+    if (skipChannelQuery_) return;
+
+    // NETDEV_Login_V30's own output (NETDEV_SELOG_INFO_S) is security-log
+    // metadata only - it carries no channel info at all, unlike
+    // Hikvision/Dahua/TVT whose login calls return channel counts directly
+    // in the same response. This second network round trip is the only way
+    // to learn the channel list on this vendor, and roughly doubles
+    // observed connect time - skipped whenever the caller already knows
+    // the channels (see LoginParams.skipChannelQuery in shared/types.ts).
+    chlCount_ = 128;
+    chlList_.resize(chlCount_);
+    BOOL ok = NETDEV_QueryVideoChlDetailListEx(lUserID_, &chlCount_, chlList_.data());
+    if (!ok && chlCount_ > static_cast<INT32>(chlList_.size())) {
+      chlList_.assign(chlCount_, {});
+      ok = NETDEV_QueryVideoChlDetailListEx(lUserID_, &chlCount_, chlList_.data());
+    }
+    if (!ok) chlCount_ = 0;
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    Napi::Array channels = Napi::Array::New(env);
+    for (INT32 i = 0; i < chlCount_; ++i) {
+      channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, chlList_[i].dwChannelID);
+    }
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("sessionId", PointerToId(lUserID_));
+    result.Set("channels", channels);
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  std::string host_;
+  int port_;
+  std::string username_;
+  std::string password_;
+  bool skipChannelQuery_;
+  Napi::Promise::Deferred deferred_;
+  LPVOID lUserID_ = nullptr;
+  INT32 chlCount_ = 0;
+  std::vector<NETDEV_VIDEO_CHL_DETAIL_INFO_EX_S> chlList_;
+};
+
 Napi::Value Login(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsObject()) {
@@ -127,46 +238,17 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   Napi::Object params = info[0].As<Napi::Object>();
-  const std::string host = params.Get("host").As<Napi::String>().Utf8Value();
+  std::string host = params.Get("host").As<Napi::String>().Utf8Value();
   const int port = params.Get("port").As<Napi::Number>().Int32Value();
-  const std::string username = params.Get("username").As<Napi::String>().Utf8Value();
-  const std::string password = params.Get("password").As<Napi::String>().Utf8Value();
+  std::string username = params.Get("username").As<Napi::String>().Utf8Value();
+  std::string password = params.Get("password").As<Napi::String>().Utf8Value();
+  const bool skipChannelQuery =
+      params.Has("skipChannelQuery") && params.Get("skipChannelQuery").As<Napi::Boolean>().Value();
 
-  NETDEV_DEVICE_LOGIN_INFO_S loginInfo = {};
-  strncpy_s(loginInfo.szIPAddr, host.c_str(), _TRUNCATE);
-  loginInfo.dwPort = port;
-  strncpy_s(loginInfo.szUserName, username.c_str(), _TRUNCATE);
-  strncpy_s(loginInfo.szPassword, password.c_str(), _TRUNCATE);
-  loginInfo.dwLoginProto = NETDEV_LOGIN_PROTO_PRIVATE;
-
-  NETDEV_SELOG_INFO_S selogInfo = {};
-  LPVOID lUserID = NETDEV_Login_V30(&loginInfo, &selogInfo);
-  if (!lUserID) {
-    const INT32 err = NETDEV_GetLastError();
-    Napi::Error::New(env, "Uniview login failed (NETDEV error " + std::to_string(err) + ")")
-        .ThrowAsJavaScriptException();
-    return env.Null();
-  }
-
-  INT32 chlCount = 128;
-  std::vector<NETDEV_VIDEO_CHL_DETAIL_INFO_EX_S> chlList(chlCount);
-  BOOL ok = NETDEV_QueryVideoChlDetailListEx(lUserID, &chlCount, chlList.data());
-  if (!ok && chlCount > static_cast<INT32>(chlList.size())) {
-    chlList.assign(chlCount, {});
-    ok = NETDEV_QueryVideoChlDetailListEx(lUserID, &chlCount, chlList.data());
-  }
-
-  Napi::Array channels = Napi::Array::New(env);
-  if (ok) {
-    for (INT32 i = 0; i < chlCount; ++i) {
-      channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, chlList[i].dwChannelID);
-    }
-  }
-
-  Napi::Object result = Napi::Object::New(env);
-  result.Set("sessionId", PointerToId(lUserID));
-  result.Set("channels", channels);
-  return result;
+  auto* worker = new LoginWorker(env, std::move(host), port, std::move(username), std::move(password), skipChannelQuery);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value Logout(const Napi::CallbackInfo& info) {
@@ -176,6 +258,64 @@ Napi::Value Logout(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+class StartLiveViewWorker : public Napi::AsyncWorker {
+ public:
+  StartLiveViewWorker(Napi::Env env, LPVOID lUserID, int channel, std::string streamType,
+                       Napi::ThreadSafeFunction tsfn)
+      : Napi::AsyncWorker(env), channel_(channel), streamType_(std::move(streamType)),
+        deferred_(Napi::Promise::Deferred::New(env)) {
+    session_ = new LiveViewSession();
+    session_->lUserID = lUserID;
+    session_->tsfn = std::move(tsfn);
+  }
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+
+    NETDEV_PREVIEWINFO_S previewInfo = {};
+    previewInfo.dwChannelID = channel_;
+    previewInfo.dwStreamType =
+        (streamType_ == "sub") ? NETDEV_LIVE_STREAM_INDEX_AUX : NETDEV_LIVE_STREAM_INDEX_MAIN;
+    previewInfo.dwLinkMode = NETDEV_TRANSPROTOCAL_RTPTCP;
+    previewInfo.hPlayWnd = nullptr;
+
+    NETDEV_STREAM_DATA_CB_S streamCB = {};
+    streamCB.bDecode = TRUE;
+    streamCB.dwCBType = NETDEV_STREAM_CB_TYPE_DECODE;
+    streamCB.lpVideoDataCB = reinterpret_cast<LPVOID>(OnDecodedFrame);
+    streamCB.lpAudioDataCB = nullptr;
+    streamCB.lpUserData = nullptr;
+
+    LPVOID lpPlayHandle = NETDEV_RealPlay_V30(session_->lUserID, &previewInfo, &streamCB);
+    if (!lpPlayHandle) {
+      const INT32 err = NETDEV_GetLastError();
+      session_->tsfn.Release();
+      delete session_;
+      session_ = nullptr;
+      SetError("NETDEV_RealPlay_V30 failed (NETDEV error " + std::to_string(err) + ")");
+      return;
+    }
+    session_->lpPlayHandle = lpPlayHandle;
+    lpPlayHandle_ = lpPlayHandle;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_sessionsByHandle[lpPlayHandle] = session_;
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), PointerToId(lpPlayHandle_))); }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  int channel_;
+  std::string streamType_;
+  LiveViewSession* session_ = nullptr;
+  LPVOID lpPlayHandle_ = nullptr;
+  Napi::Promise::Deferred deferred_;
+};
+
 Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
@@ -184,41 +324,12 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Function onFrame = info[3].As<Napi::Function>();
 
   LPVOID lUserID = IdToPointer(sessionId);
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "uniview-frame-callback", 0, 1);
 
-  auto* session = new LiveViewSession();
-  session->lUserID = lUserID;
-  session->tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "uniview-frame-callback", 0, 1);
-
-  NETDEV_PREVIEWINFO_S previewInfo = {};
-  previewInfo.dwChannelID = channel;
-  previewInfo.dwStreamType = (streamType == "sub") ? NETDEV_LIVE_STREAM_INDEX_AUX : NETDEV_LIVE_STREAM_INDEX_MAIN;
-  previewInfo.dwLinkMode = NETDEV_TRANSPROTOCAL_RTPTCP;
-  previewInfo.hPlayWnd = nullptr;
-
-  NETDEV_STREAM_DATA_CB_S streamCB = {};
-  streamCB.bDecode = TRUE;
-  streamCB.dwCBType = NETDEV_STREAM_CB_TYPE_DECODE;
-  streamCB.lpVideoDataCB = reinterpret_cast<LPVOID>(OnDecodedFrame);
-  streamCB.lpAudioDataCB = nullptr;
-  streamCB.lpUserData = nullptr;
-
-  LPVOID lpPlayHandle = NETDEV_RealPlay_V30(lUserID, &previewInfo, &streamCB);
-  if (!lpPlayHandle) {
-    const INT32 err = NETDEV_GetLastError();
-    session->tsfn.Release();
-    delete session;
-    Napi::Error::New(env, "NETDEV_RealPlay_V30 failed (NETDEV error " + std::to_string(err) + ")")
-        .ThrowAsJavaScriptException();
-    return env.Null();
-  }
-  session->lpPlayHandle = lpPlayHandle;
-
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_sessionsByHandle[lpPlayHandle] = session;
-  }
-
-  return Napi::String::New(env, PointerToId(lpPlayHandle));
+  auto* worker = new StartLiveViewWorker(env, lUserID, channel, streamType, std::move(tsfn));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {
