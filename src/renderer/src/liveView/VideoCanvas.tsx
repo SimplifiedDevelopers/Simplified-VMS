@@ -1,16 +1,15 @@
 import { useEffect, useRef } from 'react';
-import type { DecodedFrame } from '../../shared/types';
+import type { DecodedFrame } from '../../../shared/types';
 
 interface Props {
-  sessionId: string;
   viewHandle: string;
 }
 
-export function VideoTile({ sessionId, viewHandle }: Props) {
+export function VideoCanvas({ viewHandle }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const unsubscribe = window.vms.onFrame((incomingHandle, frame: DecodedFrame) => {
+    const unsubscribe = window.ssmVms.liveView.onFrame((incomingHandle, frame: DecodedFrame) => {
       if (incomingHandle !== viewHandle) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -26,11 +25,5 @@ export function VideoTile({ sessionId, viewHandle }: Props) {
     return unsubscribe;
   }, [viewHandle]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
-      onDoubleClick={() => window.vms.stopLiveView(sessionId, viewHandle)}
-    />
-  );
+  return <canvas ref={canvasRef} style={{ width: '100%', height: '100%', background: '#000', display: 'block' }} />;
 }

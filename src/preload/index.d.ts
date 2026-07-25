@@ -1,7 +1,7 @@
-import type { VmsBridge } from './index';
+import type { PreloadApi } from './index';
 
 declare global {
   interface Window {
-    vms: VmsBridge;
+    ssmVms: PreloadApi;
   }
 }

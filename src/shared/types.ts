@@ -5,6 +5,17 @@
 
 export type VendorId = 'hikvision' | 'dahua' | 'tvt' | 'uniview';
 
+// Order matches the fleet mix (largest first) — surfaced in the Device
+// Management "Add Device" vendor picker.
+export const VENDOR_ORDER: readonly VendorId[] = ['tvt', 'uniview', 'hikvision', 'dahua'];
+
+export const VENDOR_LABELS: Record<VendorId, string> = {
+  tvt: 'TVT',
+  uniview: 'UNV',
+  hikvision: 'Hik',
+  dahua: 'Dah',
+};
+
 export interface LoginParams {
   host: string;
   port: number;
@@ -25,4 +36,36 @@ export interface DecodedFrame {
   format: 'rgb32' | 'yuv420p';
   data: Buffer;
   timestampMs: number;
+}
+
+// Renderer-safe device shape — password is intentionally never included.
+// The main process resolves the actual (decrypted) credential itself when
+// starting a session, so it never has to cross the IPC boundary in plaintext
+// more than once (at creation time).
+export interface StoredDevice {
+  id: string;
+  name: string;
+  vendor: VendorId;
+  host: string;
+  port: number;
+  username: string;
+}
+
+export interface NewDeviceInput {
+  name: string;
+  vendor: VendorId;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}
+
+export interface AuthStatus {
+  hasAdminAccount: boolean;
+}
+
+export interface SavedLogin {
+  username: string;
+  password: string;
+  autoLogin: boolean;
 }

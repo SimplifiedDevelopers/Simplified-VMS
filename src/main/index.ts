@@ -1,6 +1,9 @@
 import { join } from 'path';
 import { app, BrowserWindow, shell } from 'electron';
-import { registerVmsIpcHandlers } from './ipc';
+import { registerAuthIpcHandlers } from './ipc/auth';
+import { registerDeviceIpcHandlers } from './ipc/devices';
+import { registerLiveViewIpcHandlers } from './ipc/liveView';
+import { registerPrefsIpcHandlers } from './ipc/prefs';
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -8,8 +11,11 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
+    minWidth: 960,
+    minHeight: 640,
     show: false,
     autoHideMenuBar: true,
+    backgroundColor: '#0a0e13',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -29,10 +35,13 @@ function createWindow(): void {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
   }
 
-  registerVmsIpcHandlers(() => mainWindow!.webContents);
+  registerLiveViewIpcHandlers(() => mainWindow!.webContents);
 }
 
 app.whenReady().then(() => {
+  registerAuthIpcHandlers();
+  registerDeviceIpcHandlers();
+  registerPrefsIpcHandlers();
   createWindow();
 
   app.on('activate', () => {
