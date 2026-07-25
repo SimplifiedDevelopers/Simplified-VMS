@@ -6,10 +6,7 @@ import type { ChannelInfo, DecodedFrame, StreamType, VendorId } from '../../shar
 interface CachedSession {
   vendor: VendorId;
   sessionId: string;
-  analogStart: number;
-  analogCount: number;
-  digitalStart: number;
-  digitalCount: number;
+  channels: number[];
 }
 
 // One login per device is reused across channels/tiles rather than
@@ -60,10 +57,7 @@ async function resolveSession(deviceId: string): Promise<CachedSession> {
     const cachedSession: CachedSession = {
       vendor: credentials.vendor,
       sessionId: session.sessionId,
-      analogStart: session.analogStart,
-      analogCount: session.analogCount,
-      digitalStart: session.digitalStart,
-      digitalCount: session.digitalCount,
+      channels: session.channels,
     };
     sessionsByDevice.set(deviceId, cachedSession);
     return cachedSession;
@@ -78,16 +72,7 @@ async function resolveSession(deviceId: string): Promise<CachedSession> {
 }
 
 function channelsFromSession(session: CachedSession): ChannelInfo[] {
-  const channels: ChannelInfo[] = [];
-  for (let i = 0; i < session.analogCount; i++) {
-    const channel = session.analogStart + i;
-    channels.push({ channel, label: `Channel ${channel}` });
-  }
-  for (let i = 0; i < session.digitalCount; i++) {
-    const channel = session.digitalStart + i;
-    channels.push({ channel, label: `Channel ${channel}` });
-  }
-  return channels;
+  return session.channels.map((channel) => ({ channel, label: `Channel ${channel}` }));
 }
 
 export function registerLiveViewIpcHandlers(getSender: () => WebContents): void {

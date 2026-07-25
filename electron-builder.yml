@@ -12,6 +12,8 @@ files:
 extraResources:
   - from: native/hikvision/build/Release
     to: native/hikvision/build/Release
+  - from: native/uniview/build/Release
+    to: native/uniview/build/Release
 win:
   target: nsis
   artifactName: ${productName}-Setup-${version}.${ext}

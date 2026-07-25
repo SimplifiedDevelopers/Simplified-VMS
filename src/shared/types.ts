@@ -25,15 +25,13 @@ export interface LoginParams {
 
 export interface DeviceSession {
   sessionId: string;
-  channelCount: number;
-  // Analog and digital(IP) channels are numbered in separate ranges on
-  // hybrid/NVR hardware — a device can have 0 analog + N digital channels
-  // starting well above 1 (confirmed: a pure-IP 16-channel NVR only accepts
-  // channels 33-48). Needed to build an accurate channel list per device.
-  analogStart: number;
-  analogCount: number;
-  digitalStart: number;
-  digitalCount: number;
+  // Explicit channel numbers rather than a start/count range — Hikvision's
+  // analog/digital channels sit in two separate ranges (confirmed: a
+  // pure-IP 16-channel NVR only accepts channels 33-48, not 1-16), and
+  // Uniview's NETDEV_QueryVideoChlDetailListEx returns each channel's own
+  // ID with no guaranteed contiguity at all. An explicit list is the only
+  // shape that's actually accurate for both.
+  channels: number[];
 }
 
 export interface ChannelInfo {

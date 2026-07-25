@@ -18,7 +18,7 @@ async function testLogin(vendor: VendorId, credentials: Credentials): Promise<Co
     const adapter = getAdapter(vendor);
     const session = await adapter.login(credentials);
     await adapter.logout(session.sessionId).catch(() => undefined);
-    return { ok: true, channelCount: session.channelCount };
+    return { ok: true, channelCount: session.channels.length };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
