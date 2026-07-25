@@ -49,9 +49,45 @@ struct FrameData {
   std::vector<uint8_t> pixels; // RGBA, ready for canvas ImageData
 };
 
+// BT.601 limited-range YV12 (planar Y, then V, then U — V before U is what
+// distinguishes YV12 from I420) -> RGBA, fixed-point. Confirmed against real
+// hardware that PlayM4_SetDisplayCallBack delivers YV12 (nType=3) here, not
+// RGB32 (nType=7) — the SDK's software decoder never actually produces
+// RGB32 through this callback despite T_RGB32 existing as a named constant.
+void ConvertYV12ToRGBA(const uint8_t* src, long width, long height, std::vector<uint8_t>& out) {
+  const long frameSize = width * height;
+  const uint8_t* yPlane = src;
+  const uint8_t* vPlane = src + frameSize;
+  const uint8_t* uPlane = src + frameSize + frameSize / 4;
+
+  out.resize(static_cast<size_t>(frameSize) * 4);
+  for (long row = 0; row < height; ++row) {
+    for (long col = 0; col < width; ++col) {
+      const long yIndex = row * width + col;
+      const long uvIndex = (row / 2) * (width / 2) + (col / 2);
+      const int Y = yPlane[yIndex];
+      const int U = uPlane[uvIndex] - 128;
+      const int V = vPlane[uvIndex] - 128;
+
+      int r = Y + ((91881 * V) >> 16);
+      int g = Y - ((22554 * U + 46802 * V) >> 16);
+      int b = Y + ((116130 * U) >> 16);
+      r = r < 0 ? 0 : (r > 255 ? 255 : r);
+      g = g < 0 ? 0 : (g > 255 ? 255 : g);
+      b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
+      const long outIdx = yIndex * 4;
+      out[outIdx + 0] = static_cast<uint8_t>(r);
+      out[outIdx + 1] = static_cast<uint8_t>(g);
+      out[outIdx + 2] = static_cast<uint8_t>(b);
+      out[outIdx + 3] = 255;
+    }
+  }
+}
+
 void CALLBACK OnDecodedFrame(long nPort, char* pBuf, long nSize, long nWidth, long nHeight, long nStamp,
                               long nType, long /*nReserved*/) {
-  if (nType != T_RGB32 || nSize <= 0 || nWidth <= 0 || nHeight <= 0) return;
+  if (nType != T_YV12 || nSize <= 0 || nWidth <= 0 || nHeight <= 0) return;
 
   LiveViewSession* session = nullptr;
   {
@@ -65,17 +101,7 @@ void CALLBACK OnDecodedFrame(long nPort, char* pBuf, long nSize, long nWidth, lo
   frame->width = nWidth;
   frame->height = nHeight;
   frame->timestampMs = nStamp;
-
-  // SDK's RGB32 output is Windows-convention BGRX; canvas ImageData wants RGBA.
-  const size_t pixelCount = static_cast<size_t>(nSize) / 4;
-  frame->pixels.resize(pixelCount * 4);
-  const auto* src = reinterpret_cast<const uint8_t*>(pBuf);
-  for (size_t i = 0; i < pixelCount; ++i) {
-    frame->pixels[i * 4 + 0] = src[i * 4 + 2];
-    frame->pixels[i * 4 + 1] = src[i * 4 + 1];
-    frame->pixels[i * 4 + 2] = src[i * 4 + 0];
-    frame->pixels[i * 4 + 3] = 255;
-  }
+  ConvertYV12ToRGBA(reinterpret_cast<const uint8_t*>(pBuf), nWidth, nHeight, frame->pixels);
 
   auto status = session->tsfn.NonBlockingCall(
       frame, [](Napi::Env env, Napi::Function jsCallback, FrameData* f) {
