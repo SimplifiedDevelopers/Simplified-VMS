@@ -36,6 +36,22 @@ const devices = {
   checkStatus: (id: string): Promise<ConnectionTestResult> => ipcRenderer.invoke('devices:checkStatus', id),
 };
 
+// A single shared ipcRenderer listener dispatches to per-viewHandle
+// subscribers, rather than every tile registering its own raw listener on
+// the shared channel and filtering internally — that scaled O(n) per frame
+// and tripped Node's default max-listener warning past 10 simultaneous
+// tiles (exactly what 16/25/32-channel grids need to support).
+const frameSubscribers = new Map<string, Set<(frame: DecodedFrame) => void>>();
+let rawFrameListenerRegistered = false;
+
+function ensureRawFrameListener(): void {
+  if (rawFrameListenerRegistered) return;
+  rawFrameListenerRegistered = true;
+  ipcRenderer.on('liveView:frame', (_event, viewHandle: string, frame: DecodedFrame) => {
+    frameSubscribers.get(viewHandle)?.forEach((callback) => callback(frame));
+  });
+}
+
 const liveView = {
   getChannels: (deviceId: string): Promise<ChannelInfo[]> => ipcRenderer.invoke('liveView:getChannels', deviceId),
 
@@ -45,11 +61,18 @@ const liveView = {
   stop: (deviceId: string, viewHandle: string): Promise<void> =>
     ipcRenderer.invoke('liveView:stop', deviceId, viewHandle),
 
-  onFrame: (callback: (viewHandle: string, frame: DecodedFrame) => void): (() => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, viewHandle: string, frame: DecodedFrame): void =>
-      callback(viewHandle, frame);
-    ipcRenderer.on('liveView:frame', listener);
-    return () => ipcRenderer.removeListener('liveView:frame', listener);
+  onFrame: (viewHandle: string, callback: (frame: DecodedFrame) => void): (() => void) => {
+    ensureRawFrameListener();
+    let subscribers = frameSubscribers.get(viewHandle);
+    if (!subscribers) {
+      subscribers = new Set();
+      frameSubscribers.set(viewHandle, subscribers);
+    }
+    subscribers.add(callback);
+    return () => {
+      subscribers!.delete(callback);
+      if (subscribers!.size === 0) frameSubscribers.delete(viewHandle);
+    };
   },
 };
 

@@ -9,8 +9,7 @@ export function VideoCanvas({ viewHandle }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const unsubscribe = window.ssmVms.liveView.onFrame((incomingHandle, frame: DecodedFrame) => {
-      if (incomingHandle !== viewHandle) return;
+    const unsubscribe = window.ssmVms.liveView.onFrame(viewHandle, (frame: DecodedFrame) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
       if (canvas.width !== frame.width || canvas.height !== frame.height) {
