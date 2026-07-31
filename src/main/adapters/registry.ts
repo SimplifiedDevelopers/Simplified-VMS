@@ -1,5 +1,6 @@
 import { DahuaAdapter } from './dahua';
 import { HikvisionAdapter } from './hikvision';
+import { OnvifAdapter } from './onvif';
 import { TvtAdapter } from './tvt';
 import { UniviewAdapter } from './uniview';
 import type { VmsAdapter } from './vmsAdapter';
@@ -10,6 +11,7 @@ const adapters: Partial<Record<VendorId, VmsAdapter>> = {
   uniview: new UniviewAdapter(),
   dahua: new DahuaAdapter(),
   tvt: new TvtAdapter(),
+  onvif: new OnvifAdapter(),
 };
 
 export function getAdapter(vendor: VendorId): VmsAdapter {

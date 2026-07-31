@@ -1,7 +1,15 @@
 appId: net.simplifieddevs.ssmvms
-productName: SSM VMS
+productName: Simplified VMS
 directories:
   output: release
+# GitHub Releases as the update feed — the repo was made public specifically
+# so electron-updater can fetch release metadata/assets without needing a
+# token baked into every installed copy of the app (a private repo would
+# require that, and it'd be extractable from the installer by anyone).
+publish:
+  provider: github
+  owner: simplifieddevs
+  repo: Simplified-VMS
 files:
   - out/**/*
   - package.json
@@ -18,11 +26,32 @@ extraResources:
     to: native/dahua/build/Release
   - from: native/tvt/build/Release
     to: native/tvt/build/Release
+  - from: docs
+    to: docs
+  # ffmpeg/ffprobe binaries for the ONVIF adapter's RTSP decode pipeline —
+  # same "must live outside app.asar as plain files" reasoning as the
+  # native addons above: these are spawned as child processes, and Windows
+  # can't exec a binary from inside an asar archive either.
+  - from: node_modules/ffmpeg-static/ffmpeg.exe
+    to: ffmpeg.exe
+  - from: node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe
+    to: ffprobe.exe
 win:
   target: nsis
   artifactName: ${productName}-Setup-${version}.${ext}
+  icon: build/icon.ico
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
+  # Real SSM branding (navy #00007F + the white logo, matching the in-app
+  # header/splash treatment) instead of NSIS's stock default wizard
+  # graphics and the default Electron icon. Generated from the existing
+  # src/renderer/src/assets/logo-white.png — see build/ for the generated
+  # .ico/.bmp files themselves (binary, not meaningfully diffable).
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerSidebar: build/installerSidebar.bmp
+  uninstallerSidebar: build/installerSidebar.bmp
+  installerHeader: build/installerHeader.bmp

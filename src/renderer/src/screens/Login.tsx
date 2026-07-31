@@ -1,19 +1,24 @@
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
 import { theme } from '../theme';
-import { AuthLayout } from './AuthLayout';
 
 interface Props {
   onLoggedIn: () => void;
+  // False right after an explicit logout (see AppShell.tsx's handleLogout)
+  // - stops a saved Auto Login from instantly re-authenticating past the
+  // login screen the user just deliberately returned to. This is the exact
+  // bug that sank an earlier, cruder version of Auto Login in this app (see
+  // the removal note that used to live in AppShell.tsx) - true on every
+  // other render, including a fresh app launch.
+  allowAutoLogin?: boolean;
 }
 
-export function Login({ onLoggedIn }: Props) {
+export function Login({ onLoggedIn, allowAutoLogin = true }: Props) {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [savePassword, setSavePassword] = useState(false);
   const [autoLogin, setAutoLogin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [showForgot, setShowForgot] = useState(false);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
@@ -25,8 +30,9 @@ export function Login({ onLoggedIn }: Props) {
         setPassword(saved.password);
         setSavePassword(true);
         setAutoLogin(saved.autoLogin);
-        if (saved.autoLogin) {
-          attemptLogin(saved.username, saved.password, true, saved.autoLogin);
+        if (saved.autoLogin && allowAutoLogin) {
+          attemptLogin(saved.username, saved.password, true, true);
+          setReady(true);
           return;
         }
       }
@@ -45,7 +51,6 @@ export function Login({ onLoggedIn }: Props) {
       const ok = await window.ssmVms.auth.login(u, p);
       if (!ok) {
         setError('Incorrect username or password.');
-        setReady(true);
         return;
       }
       if (save) {
@@ -56,7 +61,6 @@ export function Login({ onLoggedIn }: Props) {
       onLoggedIn();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setReady(true);
     } finally {
       setBusy(false);
     }
@@ -64,75 +68,83 @@ export function Login({ onLoggedIn }: Props) {
 
   function handleSubmit(e: FormEvent): void {
     e.preventDefault();
-    attemptLogin(username, password, savePassword, autoLogin);
+    attemptLogin(username, password, savePassword, savePassword && autoLogin);
   }
 
-  if (!ready) return <AuthLayout><div /></AuthLayout>;
+  if (!ready) return null;
 
   return (
-    <AuthLayout>
-      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
-        <h1 style={{ fontSize: '17px', fontWeight: 600, color: theme.text, margin: '0 0 0.5rem' }}>Sign in</h1>
+    <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+      <h1 style={{ fontSize: '17px', fontWeight: 600, color: theme.text, margin: '0 0 0.5rem' }}>Sign in</h1>
 
-        <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="Username"
-          style={inputStyle}
+      <input
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        placeholder="Username"
+        style={inputStyle}
+      />
+      <input
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        type="password"
+        placeholder="Password"
+        style={inputStyle}
+        required
+      />
+
+      <div style={{ display: 'flex', gap: '1.2rem' }}>
+        <Checkbox
+          label="Save password"
+          checked={savePassword}
+          onChange={(checked) => {
+            setSavePassword(checked);
+            // Auto login is meaningless without a saved password - keep the
+            // two in sync rather than letting the UI show a checked Auto
+            // login next to an unchecked Save password.
+            if (!checked) setAutoLogin(false);
+          }}
         />
-        <div style={{ position: 'relative' }}>
-          <input
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            type="password"
-            placeholder="Password"
-            style={inputStyle}
-            required
-          />
-        </div>
+        <Checkbox label="Auto login" checked={autoLogin} onChange={setAutoLogin} disabled={!savePassword} />
+      </div>
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ display: 'flex', gap: '1rem' }}>
-            <Checkbox label="Save password" checked={savePassword} onChange={setSavePassword} />
-            <Checkbox
-              label="Auto login"
-              checked={autoLogin}
-              onChange={(v) => {
-                setAutoLogin(v);
-                if (v) setSavePassword(true);
-              }}
-            />
-          </div>
-          <button
-            type="button"
-            onClick={() => setShowForgot((v) => !v)}
-            style={{ background: 'none', border: 'none', color: theme.accentHover, fontSize: '12px', cursor: 'pointer', padding: 0 }}
-          >
-            Forgot password?
-          </button>
-        </div>
+      {error && <div style={{ fontSize: '12.5px', color: theme.danger }}>{error}</div>}
 
-        {showForgot && (
-          <div style={{ fontSize: '11.5px', color: theme.textMuted, lineHeight: 1.5 }}>
-            This account only exists on this computer — there's no remote recovery. Ask whoever set up this
-            installation to reset it, or reinstall if this is a fresh setup.
-          </div>
-        )}
-
-        {error && <div style={{ fontSize: '12.5px', color: theme.danger }}>{error}</div>}
-
-        <button type="submit" disabled={busy} style={primaryButtonStyle}>
-          {busy ? 'Signing in…' : 'Login'}
-        </button>
-      </form>
-    </AuthLayout>
+      <button type="submit" disabled={busy} style={primaryButtonStyle}>
+        {busy ? 'Signing in…' : 'Login'}
+      </button>
+    </form>
   );
 }
 
-function Checkbox({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+function Checkbox({
+  label,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
-    <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '12px', color: theme.textMuted, cursor: 'pointer' }}>
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} style={{ accentColor: theme.accent }} />
+    <label
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.4rem',
+        fontSize: '12px',
+        color: disabled ? theme.textFaint : theme.textMuted,
+        cursor: disabled ? 'default' : 'pointer',
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ accentColor: theme.accent }}
+      />
       {label}
     </label>
   );

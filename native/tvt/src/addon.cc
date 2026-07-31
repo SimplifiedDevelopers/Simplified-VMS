@@ -15,7 +15,9 @@
 // channel/format assumption made before a vendor's first real test.
 #include <napi.h>
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,6 +32,20 @@ struct LiveViewSession {
   Napi::ThreadSafeFunction tsfn;
   LONG lUserID = -1;
   POINTERHANDLE lLiveHandle = -1;
+  // Playback sessions reuse this same struct/handle map (see
+  // FindRecordingsWorker/StartPlaybackWorker below) rather than a separate
+  // one, mirroring native/uniview/src/addon.cc's exact pattern - only this
+  // flag differs, telling DestroySession which SDK stop call applies to
+  // lLiveHandle (NET_SDK_StopLivePlay vs NET_SDK_StopPlayBack).
+  bool isPlayback = false;
+  // Set from the renderer (liveView:setFrameDelivery) when this tile isn't
+  // actually visible - hidden behind an expanded tile, or the app tab
+  // isn't the active one. Skips the YUV/I420->RGBA conversion, buffer
+  // copy, and IPC dispatch for a frame nobody renders (real, measured
+  // waste across a 50+ device fleet) without touching the underlying
+  // decode session, so resuming is instant. std::atomic since it's
+  // written from the N-API call thread and read from the decode callback.
+  std::atomic<bool> framePaused{false};
 };
 
 std::mutex g_mutex;
@@ -96,6 +112,7 @@ void CALLBACK OnYUVFrame(POINTERHANDLE lLiveHandle, DECODE_FRAME_INFO frameInfo,
   if (!frameInfo.pData || frameInfo.nWidth <= 0 || frameInfo.nHeight <= 0) return;
   auto* session = static_cast<LiveViewSession*>(pUser);
   if (!session) return;
+  if (session->framePaused.load(std::memory_order_relaxed)) return;
 
   auto* frame = new FrameData();
   frame->width = frameInfo.nWidth;
@@ -113,18 +130,95 @@ void CALLBACK OnYUVFrame(POINTERHANDLE lLiveHandle, DECODE_FRAME_INFO frameInfo,
         obj.Set("height", f->height);
         obj.Set("format", "rgb32");
         obj.Set("timestampMs", f->timestampMs);
-        obj.Set("data", Napi::Buffer<uint8_t>::Copy(env, f->pixels.data(), f->pixels.size()));
+        // NewOrCopy hands the already-converted buffer straight to V8
+        // (falling back to a copy only if the platform disallows external
+        // buffers) instead of Copy's unconditional second full-frame
+        // memcpy — real, measured waste per the same resource-usage audit
+        // that found the hidden-tile issue. Ownership of `f` (and its
+        // pixels vector) transfers to the finalizer, which now owns the
+        // `delete` that used to happen unconditionally right after
+        // jsCallback.Call below.
+        obj.Set("data", Napi::Buffer<uint8_t>::NewOrCopy(
+                             env, f->pixels.data(), f->pixels.size(),
+                             [](Napi::Env /*env*/, uint8_t* /*data*/, FrameData* frame) { delete frame; }, f));
         jsCallback.Call({obj});
-        delete f;
       });
   if (status != napi_ok) delete frame;
   (void)lLiveHandle;
 }
 
 void DestroySession(LiveViewSession* session) {
-  NET_SDK_StopLivePlay(session->lLiveHandle);
+  if (session->isPlayback) {
+    NET_SDK_StopPlayBack(session->lLiveHandle);
+  } else {
+    NET_SDK_StopLivePlay(session->lLiveHandle);
+  }
   session->tsfn.Release();
   delete session;
+}
+
+// DD_TIME's fields mirror C's struct tm exactly - year is "current year
+// minus 1900" and month is "0-11, January = 0" per the SDK header's own
+// comments. Treated as the device's LOCAL time (localtime_s/localtime_r),
+// matching how DVR/NVR recording timestamps are conventionally the
+// device's own clock, not UTC - unverified against real hardware yet, same
+// as every other vendor time-format assumption made before a device's
+// first real test.
+//
+// nTotalseconds was originally assumed to be plain Unix epoch seconds
+// (matching NET_SDK_PLAYCTRL_SETPOS's own doc comment, which uses that same
+// convention for its own dwInValue parameter) - confirmed WRONG against a
+// real device: NET_SDK_FindNextFile always returns nTotalseconds=0 on every
+// result, while the broken-down fields (year/month/day/hour/minute/second)
+// are all populated correctly. DdTimeToEpochMs reconstructs the epoch from
+// those broken-down fields via mktime() instead, ignoring nTotalseconds
+// entirely; only EpochMsToDdTime still fills nTotalseconds too, in case
+// some other SDK call actually reads it on the way in (untested).
+DD_TIME EpochMsToDdTime(int64_t epochMs) {
+  const time_t epochSec = static_cast<time_t>(epochMs / 1000);
+  struct tm tmVal = {};
+#ifdef _WIN32
+  localtime_s(&tmVal, &epochSec);
+#else
+  localtime_r(&epochSec, &tmVal);
+#endif
+  DD_TIME t = {};
+  t.second = static_cast<unsigned char>(tmVal.tm_sec);
+  t.minute = static_cast<unsigned char>(tmVal.tm_min);
+  t.hour = static_cast<unsigned char>(tmVal.tm_hour);
+  t.wday = static_cast<unsigned char>(tmVal.tm_wday);
+  t.mday = static_cast<unsigned char>(tmVal.tm_mday);
+  t.month = static_cast<unsigned char>(tmVal.tm_mon);
+  t.year = static_cast<unsigned short>(tmVal.tm_year);
+  t.nTotalseconds = static_cast<int>(epochSec);
+  t.nMicrosecond = 0;
+  return t;
+}
+
+int64_t DdTimeToEpochMs(const DD_TIME& t) {
+  struct tm tmVal = {};
+  tmVal.tm_year = static_cast<int>(t.year);
+  tmVal.tm_mon = static_cast<int>(t.month);
+  tmVal.tm_mday = static_cast<int>(t.mday);
+  tmVal.tm_hour = static_cast<int>(t.hour);
+  tmVal.tm_min = static_cast<int>(t.minute);
+  tmVal.tm_sec = static_cast<int>(t.second);
+  tmVal.tm_isdst = -1;
+  const time_t epochSec = mktime(&tmVal);
+  return static_cast<int64_t>(epochSec) * 1000;
+}
+
+// DD_RECORD_TYPE is a bitmask (dwrdvstypedef.h) - DD_RECORD_TYPE_INTELLIGENT
+// is itself an OR of every AI-detection bit (face/line-cross/perimeter/etc),
+// matching this app's 'smart' bucket; DD_RECORD_TYPE_MOTION is basic motion
+// detection; everything else (manual/scheduled recording) is 'continuous'.
+// A file's dwRecType is checked against the broader category first (smart
+// before motion) since some devices may OR multiple bits onto one segment.
+std::string ClassifyRecType(DWORD recType) {
+  if (recType & DD_RECORD_TYPE_INTELLIGENT) return "smart";
+  if (recType & DD_RECORD_TYPE_MOTION) return "motion";
+  if (recType & (DD_RECORD_TYPE_MANUAL | DD_RECORD_TYPE_SCHEDULE)) return "continuous";
+  return "other";
 }
 
 }  // namespace
@@ -133,12 +227,14 @@ void DestroySession(LiveViewSession* session) {
 // the main thread, and why login is not serialized by any mutex here.
 class LoginWorker : public Napi::AsyncWorker {
  public:
-  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password)
+  LoginWorker(Napi::Env env, std::string host, int port, std::string username, std::string password,
+              bool skipChannelQuery)
       : Napi::AsyncWorker(env),
         host_(std::move(host)),
         port_(port),
         username_(std::move(username)),
         password_(std::move(password)),
+        skipChannelQuery_(skipChannelQuery),
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
@@ -150,6 +246,30 @@ class LoginWorker : public Napi::AsyncWorker {
       return;
     }
     channelCount_ = deviceInfo.videoInputNum;
+
+    // Real camera names, not "Channel N" - unlike Hikvision/Dahua, TVT's SDK
+    // returns every channel's configured name in ONE call: lChannel = -1
+    // means "all channels" (confirmed via the bundled SDKDEMO's
+    // ConfigDlg.cpp, which passes m_currentChannel < 0 for exactly this).
+    // Only worth paying for when the name is actually needed - see the
+    // matching comment in native/dahua/src/addon.cc.
+    if (skipChannelQuery_ || channelCount_ <= 0) return;
+    std::vector<DD_CHANNEL_CONFIG> configs(static_cast<size_t>(channelCount_));
+    for (auto& cfg : configs) cfg.iSize = sizeof(DD_CHANNEL_CONFIG);
+    DWORD bytesReturned = 0;
+    const BOOL ok = NET_SDK_GetDVRConfig(lUserID_, DD_CONFIG_ITEM_CHNN_CONFIG, -1, configs.data(),
+                                         static_cast<DWORD>(sizeof(DD_CHANNEL_CONFIG) * configs.size()),
+                                         &bytesReturned, FALSE);
+    if (!ok) {
+      fprintf(stderr, "[tvt] channel name fetch failed NET_SDK error=%lu\n",
+              static_cast<unsigned long>(NET_SDK_GetLastError()));
+      fflush(stderr);
+      return;
+    }
+    for (int i = 0; i < channelCount_; ++i) {
+      const size_t len = strnlen(configs[static_cast<size_t>(i)].name, sizeof(configs[static_cast<size_t>(i)].name));
+      channelNames_.emplace_back(configs[static_cast<size_t>(i)].name, len);
+    }
   }
 
   void OnOK() override {
@@ -157,7 +277,12 @@ class LoginWorker : public Napi::AsyncWorker {
     // Channels are documented as 0-based (NET_SDK_CLIENTINFO.lChannel comment).
     Napi::Array channels = Napi::Array::New(env);
     for (int i = 0; i < channelCount_; ++i) {
-      channels[static_cast<uint32_t>(i)] = Napi::Number::New(env, i);
+      const std::string name = (static_cast<size_t>(i) < channelNames_.size()) ? channelNames_[static_cast<size_t>(i)] : "";
+      const std::string label = name.empty() ? "Channel " + std::to_string(i) : name;
+      Napi::Object entry = Napi::Object::New(env);
+      entry.Set("channel", Napi::Number::New(env, i));
+      entry.Set("label", Napi::String::New(env, label));
+      channels[static_cast<uint32_t>(i)] = entry;
     }
 
     Napi::Object result = Napi::Object::New(env);
@@ -175,9 +300,11 @@ class LoginWorker : public Napi::AsyncWorker {
   int port_;
   std::string username_;
   std::string password_;
+  bool skipChannelQuery_;
   Napi::Promise::Deferred deferred_;
   LONG lUserID_ = -1;
   int channelCount_ = 0;
+  std::vector<std::string> channelNames_;
 };
 
 Napi::Value Login(const Napi::CallbackInfo& info) {
@@ -191,8 +318,11 @@ Napi::Value Login(const Napi::CallbackInfo& info) {
   const int port = params.Get("port").As<Napi::Number>().Int32Value();
   std::string username = params.Get("username").As<Napi::String>().Utf8Value();
   std::string password = params.Get("password").As<Napi::String>().Utf8Value();
+  const bool skipChannelQuery =
+      params.Has("skipChannelQuery") && params.Get("skipChannelQuery").As<Napi::Boolean>().Value();
 
-  auto* worker = new LoginWorker(env, std::move(host), port, std::move(username), std::move(password));
+  auto* worker =
+      new LoginWorker(env, std::move(host), port, std::move(username), std::move(password), skipChannelQuery);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;
@@ -271,13 +401,72 @@ Napi::Value StartLiveView(const Napi::CallbackInfo& info) {
   Napi::Function onFrame = info[3].As<Napi::Function>();
 
   const LONG lUserID = std::stol(sessionId);
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-frame-callback", 0, 1);
+  // maxQueueSize=2 (was 0/unbounded) — confirmed live this was a real,
+  // severe memory leak: when the renderer falls behind (heavy multi-
+  // channel decode/paint load), an unbounded queue lets every decoded
+  // frame pile up forever with nothing to stop it, observed growing to
+  // 51GB and taking the whole system down (Windows'
+  // Resource-Exhaustion-Detector flagged electron.exe directly). A small
+  // bound is also just the *correct* behavior for live video regardless —
+  // if the consumer can't keep up, drop stale frames and show the
+  // latest one, don't accumulate a backlog. The existing NonBlockingCall
+  // caller already does `if (status != napi_ok) delete frame;`, so a
+  // frame that doesn't fit in the bounded queue is already cleanly
+  // discarded with no extra code needed here.
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-frame-callback", 2, 1);
 
   auto* worker = new StartLiveViewWorker(env, lUserID, channel, streamType, std::move(tsfn));
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;
 }
+
+// Runs off the main thread — see the matching Uniview addon's doc comment
+// on this exact same class shape: StopLiveView used to be a plain
+// synchronous N-API function, calling directly into the vendor SDK's own
+// stop function on Electron's main thread. If that ever hangs (this whole
+// family of vendor SDKs has real-hardware-confirmed history of a sibling
+// "start" call hanging indefinitely), it blocks the entire app, not just
+// this one tile — confirmed live via a double-click expand/collapse
+// freezing the whole window, not just the affected channel.
+class StopLiveViewWorker : public Napi::AsyncWorker {
+ public:
+  StopLiveViewWorker(Napi::Env env, POINTERHANDLE lLiveHandle)
+      : Napi::AsyncWorker(env), lLiveHandle_(lLiveHandle),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    LiveViewSession* session = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      auto it = g_sessionsByHandle.find(lLiveHandle_);
+      if (it != g_sessionsByHandle.end()) {
+        session = it->second;
+        g_sessionsByHandle.erase(it);
+      }
+    }
+    if (session) {
+      // Acquires the SAME per-device mutex StartLiveView uses — without
+      // this, a stop for one channel could run fully concurrently against
+      // the SDK with a start (or another stop) for a DIFFERENT channel on
+      // the SAME device, since only Start was ever serialized against
+      // this lock. Confirmed as a real, unaddressed gap during real-
+      // hardware freeze testing on the Uniview vendor; applied here for
+      // consistency even though this exact freeze was only reproduced on
+      // Uniview so far.
+      std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session->lUserID));
+      DestroySession(session);
+    }
+  }
+
+  void OnOK() override { deferred_.Resolve(Env().Undefined()); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  POINTERHANDLE lLiveHandle_;
+  Napi::Promise::Deferred deferred_;
+};
 
 Napi::Value StopLiveView(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -288,18 +477,572 @@ Napi::Value StopLiveView(const Napi::CallbackInfo& info) {
   // stopLiveView, handles like 2818686989344 are far beyond 32-bit range).
   const POINTERHANDLE lLiveHandle = std::stoll(viewHandle);
 
+  auto* worker = new StopLiveViewWorker(env, lLiveHandle);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+// Toggles frame delivery for a session without touching the underlying
+// SDK stream at all — used when a tile goes off-screen (hidden behind an
+// expanded tile, or the whole app tab isn't the active one) so it can
+// resume instantly with no reconnect when it becomes visible again,
+// unlike actually stopping the session.
+Napi::Value SetFrameDelivery(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const std::string viewHandle = info[0].As<Napi::String>().Utf8Value();
+  const bool enabled = info[1].As<Napi::Boolean>().Value();
+  const POINTERHANDLE lLiveHandle = std::stoll(viewHandle);
+
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_sessionsByHandle.find(lLiveHandle);
+  if (it != g_sessionsByHandle.end()) {
+    it->second->framePaused.store(!enabled, std::memory_order_relaxed);
+  }
+  return env.Undefined();
+}
+
+// Recording search is a real network round trip (same class of call as
+// Login/StartLiveView) - runs off the main thread for the same reason.
+class FindRecordingsWorker : public Napi::AsyncWorker {
+ public:
+  FindRecordingsWorker(Napi::Env env, LONG lUserID, int channel, int64_t beginMs, int64_t endMs, DWORD recTypeMask)
+      : Napi::AsyncWorker(env),
+        lUserID_(lUserID),
+        channel_(channel),
+        beginMs_(beginMs),
+        endMs_(endMs),
+        recTypeMask_(recTypeMask),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
+
+    DD_TIME begin = EpochMsToDdTime(beginMs_);
+    DD_TIME end = EpochMsToDdTime(endMs_);
+
+    const POINTERHANDLE hFind = NET_SDK_FindFile(lUserID_, channel_, &begin, &end);
+    if (hFind == -1) {
+      const DWORD err = NET_SDK_GetLastError();
+      SetError("NET_SDK_FindFile failed (error " + std::to_string(err) + ")");
+      return;
+    }
+
+    NET_SDK_REC_FILE fileInfo = {};
+    for (;;) {
+      const LONG ret = NET_SDK_FindNextFile(hFind, &fileInfo);
+      if (ret == NET_SDK_NOMOREFILE || ret == NET_SDK_FILE_NOFIND) break;
+      if (ret != NET_SDK_FILE_SUCCESS) {
+        SetError("NET_SDK_FindNextFile failed (error " + std::to_string(ret) + ")");
+        NET_SDK_FindClose(hFind);
+        return;
+      }
+      if (recTypeMask_ == 0 || (fileInfo.dwRecType & recTypeMask_)) {
+        segments_.push_back({DdTimeToEpochMs(fileInfo.startTime), DdTimeToEpochMs(fileInfo.stopTime),
+                              ClassifyRecType(fileInfo.dwRecType)});
+      }
+    }
+    NET_SDK_FindClose(hFind);
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    Napi::Array result = Napi::Array::New(env);
+    for (size_t i = 0; i < segments_.size(); ++i) {
+      const auto& seg = segments_[i];
+      Napi::Object obj = Napi::Object::New(env);
+      obj.Set("startMs", Napi::Number::New(env, static_cast<double>(seg.startMs)));
+      obj.Set("endMs", Napi::Number::New(env, static_cast<double>(seg.endMs)));
+      obj.Set("type", seg.type);
+      result[static_cast<uint32_t>(i)] = obj;
+    }
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  struct Segment {
+    int64_t startMs;
+    int64_t endMs;
+    std::string type;
+  };
+
+  LONG lUserID_;
+  int channel_;
+  int64_t beginMs_;
+  int64_t endMs_;
+  DWORD recTypeMask_;
+  Napi::Promise::Deferred deferred_;
+  std::vector<Segment> segments_;
+};
+
+// filters ('all'|'continuous'|'motion'|'smart') -> a single DD_RECORD_TYPE
+// bitmask checked against each found file's own dwRecType, rather than
+// issuing one search per type like Uniview does - TVT's NET_SDK_FindFile has
+// no per-type search parameter at all (only a time range), so every search
+// already returns every type and filtering happens client-side against the
+// mask instead.
+DWORD FiltersToRecTypeMask(const std::vector<std::string>& filters) {
+  DWORD mask = 0;
+  for (const auto& f : filters) {
+    if (f == "all") return 0;  // 0 means "no filtering" below
+    if (f == "continuous") mask |= (DD_RECORD_TYPE_MANUAL | DD_RECORD_TYPE_SCHEDULE);
+    if (f == "motion") mask |= DD_RECORD_TYPE_MOTION;
+    if (f == "smart") mask |= DD_RECORD_TYPE_INTELLIGENT;
+  }
+  return mask;
+}
+
+Napi::Value FindRecordings(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
+  const int channel = info[1].As<Napi::Number>().Int32Value();
+  const int64_t beginMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
+  const int64_t endMs = static_cast<int64_t>(info[3].As<Napi::Number>().DoubleValue());
+
+  Napi::Array filtersArr = info[4].As<Napi::Array>();
+  std::vector<std::string> filters;
+  for (uint32_t i = 0; i < filtersArr.Length(); ++i) {
+    filters.push_back(filtersArr.Get(i).As<Napi::String>().Utf8Value());
+  }
+
+  const LONG lUserID = std::stol(sessionId);
+  auto* worker = new FindRecordingsWorker(env, lUserID, channel, beginMs, endMs, FiltersToRecTypeMask(filters));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+class StartPlaybackWorker : public Napi::AsyncWorker {
+ public:
+  StartPlaybackWorker(Napi::Env env, LONG lUserID, int channel, int64_t beginMs, int64_t endMs,
+                       Napi::ThreadSafeFunction tsfn)
+      : Napi::AsyncWorker(env), channel_(channel), beginMs_(beginMs), endMs_(endMs),
+        deferred_(Napi::Promise::Deferred::New(env)) {
+    session_ = new LiveViewSession();
+    session_->lUserID = lUserID;
+    session_->tsfn = std::move(tsfn);
+    session_->isPlayback = true;
+  }
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+
+    DD_TIME begin = EpochMsToDdTime(beginMs_);
+    DD_TIME end = EpochMsToDdTime(endMs_);
+    LONG channelArr[1] = {static_cast<LONG>(channel_)};
+    // No native window rendering (matching StartLiveView's hPlayWnd=nullptr
+    // pattern) - a real HWND slot is still required by the signature even
+    // though it stays unused, so this is a valid one-element array of NULL
+    // rather than a null array pointer.
+    HWND hwndArr[1] = {nullptr};
+
+    const POINTERHANDLE lPlayHandle = NET_SDK_PlayBackByTime(session_->lUserID, channelArr, 1, &begin, &end, hwndArr);
+    if (lPlayHandle == -1) {
+      const DWORD err = NET_SDK_GetLastError();
+      session_->tsfn.Release();
+      delete session_;
+      session_ = nullptr;
+      SetError("NET_SDK_PlayBackByTime failed (error " + std::to_string(err) + ")");
+      return;
+    }
+    session_->lLiveHandle = lPlayHandle;
+    lPlayHandle_ = lPlayHandle;
+
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_sessionsByHandle[lPlayHandle] = session_;
+    }
+
+    NET_SDK_SetPlayYUVCallBack(lPlayHandle, OnYUVFrame, session_);
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(lPlayHandle_))); }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  int channel_;
+  int64_t beginMs_;
+  int64_t endMs_;
+  LiveViewSession* session_ = nullptr;
+  POINTERHANDLE lPlayHandle_ = -1;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
+  const int channel = info[1].As<Napi::Number>().Int32Value();
+  const int64_t beginMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
+  const int64_t endMs = static_cast<int64_t>(info[3].As<Napi::Number>().DoubleValue());
+  Napi::Function onFrame = info[4].As<Napi::Function>();
+
+  const LONG lUserID = std::stol(sessionId);
+  // maxQueueSize=2 (was 0/unbounded) — see the matching comment on the
+  // live-view StartLiveView's own tsfn creation above for why.
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-playback-frame-callback", 2, 1);
+
+  auto* worker = new StartPlaybackWorker(env, lUserID, channel, beginMs, endMs, std::move(tsfn));
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+// See the matching note in native/uniview/src/addon.cc - every one of these
+// runs via AsyncWorker rather than synchronously on the N-API thread, since
+// any real SDK call (even one that looks cheap, like a control command
+// against an already-open handle) can unpredictably hang against a slow or
+// uncooperative device.
+class ControlPlaybackWorker : public Napi::AsyncWorker {
+ public:
+  ControlPlaybackWorker(Napi::Env env, POINTERHANDLE lPlayHandle, std::string command, DWORD seekEpochSec,
+                         DWORD speedValue)
+      : Napi::AsyncWorker(env),
+        lPlayHandle_(lPlayHandle),
+        command_(std::move(command)),
+        seekEpochSec_(seekEpochSec),
+        speedValue_(speedValue),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    BOOL ok = FALSE;
+    DWORD outValue = 0;
+    if (command_ == "pause") {
+      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_PAUSE, 0, &outValue);
+    } else if (command_ == "resume") {
+      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_RESUME, 0, &outValue);
+    } else if (command_ == "seek") {
+      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_SETPOS, seekEpochSec_, &outValue);
+    } else if (command_ == "setSpeed") {
+      // No documented explicit speed-multiplier parameter for FF (unlike
+      // Uniview's dedicated forward-speed enum) - the SDK header only shows
+      // FF as a step control, called repeatedly to cycle through the
+      // device's own internal speed levels. speedValue_ (1/2/4, see
+      // SpeedMultiplierToFfSteps below) is treated as "how many times to
+      // call FF from a fresh normal-speed baseline" - unverified against
+      // real hardware yet.
+      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_NORMAL, 0, &outValue);
+      for (DWORD i = 0; ok && i < speedValue_; ++i) {
+        ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_FF, 0, &outValue);
+      }
+    } else if (command_ == "stepFrame") {
+      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_FRAME, 0, &outValue);
+    }
+    if (!ok) {
+      const DWORD err = NET_SDK_GetLastError();
+      SetError("NET_SDK_PlayBackControl failed (error " + std::to_string(err) + ")");
+    }
+  }
+
+  void OnOK() override { deferred_.Resolve(Env().Undefined()); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  POINTERHANDLE lPlayHandle_;
+  std::string command_;
+  DWORD seekEpochSec_;
+  DWORD speedValue_;
+  Napi::Promise::Deferred deferred_;
+};
+
+// speedMultiplier (1/2/4) -> number of FF steps from normal speed - see the
+// matching comment on ControlPlaybackWorker's "setSpeed" branch.
+DWORD SpeedMultiplierToFfSteps(int multiplier) {
+  switch (multiplier) {
+    case 2: return 1;
+    case 4: return 2;
+    default: return 0;
+  }
+}
+
+Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const POINTERHANDLE lPlayHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
+  const std::string command = info[1].As<Napi::String>().Utf8Value();
+  const DWORD seekEpochSec =
+      (command == "seek") ? static_cast<DWORD>(info[2].As<Napi::Number>().DoubleValue() / 1000.0) : 0;
+  const DWORD speedValue =
+      (command == "setSpeed") ? SpeedMultiplierToFfSteps(info[2].As<Napi::Number>().Int32Value()) : 0;
+
+  auto* worker = new ControlPlaybackWorker(env, lPlayHandle, command, seekEpochSec, speedValue);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+class GetPlaybackTimeWorker : public Napi::AsyncWorker {
+ public:
+  GetPlaybackTimeWorker(Napi::Env env, POINTERHANDLE lPlayHandle)
+      : Napi::AsyncWorker(env), lPlayHandle_(lPlayHandle), deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    DD_TIME osdTime = {};
+    if (NET_SDK_GetPlayBackOsdTime(lPlayHandle_, &osdTime)) {
+      playTimeMs_ = DdTimeToEpochMs(osdTime);
+    }
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::Number::New(Env(), static_cast<double>(playTimeMs_))); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  POINTERHANDLE lPlayHandle_;
+  int64_t playTimeMs_ = 0;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value GetPlaybackTime(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const POINTERHANDLE lPlayHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
+  auto* worker = new GetPlaybackTimeWorker(env, lPlayHandle);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+class StopPlaybackWorker : public Napi::AsyncWorker {
+ public:
+  StopPlaybackWorker(Napi::Env env, LiveViewSession* session)
+      : Napi::AsyncWorker(env), session_(session), deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    if (session_) DestroySession(session_);
+  }
+
+  void OnOK() override { deferred_.Resolve(Env().Undefined()); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  LiveViewSession* session_;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value StopPlayback(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const POINTERHANDLE lPlayHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
+
   LiveViewSession* session = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_sessionsByHandle.find(lLiveHandle);
+    auto it = g_sessionsByHandle.find(lPlayHandle);
     if (it != g_sessionsByHandle.end()) {
       session = it->second;
       g_sessionsByHandle.erase(it);
     }
   }
-  if (session) DestroySession(session);
 
-  return env.Undefined();
+  auto* worker = new StopPlaybackWorker(env, session);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+class StartBackupWorker : public Napi::AsyncWorker {
+ public:
+  StartBackupWorker(Napi::Env env, LONG lUserID, int channel, int64_t beginMs, int64_t endMs,
+                     std::string saveFilePath)
+      : Napi::AsyncWorker(env),
+        lUserID_(lUserID),
+        channel_(channel),
+        beginMs_(beginMs),
+        endMs_(endMs),
+        saveFilePath_(std::move(saveFilePath)),
+        deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
+
+    DD_TIME begin = EpochMsToDdTime(beginMs_);
+    DD_TIME end = EpochMsToDdTime(endMs_);
+
+    downloadHandle_ =
+        NET_SDK_GetFileByTime(lUserID_, channel_, &begin, &end, const_cast<char*>(saveFilePath_.c_str()));
+    if (downloadHandle_ == -1) {
+      const DWORD err = NET_SDK_GetLastError();
+      SetError("NET_SDK_GetFileByTime failed (error " + std::to_string(err) + ")");
+    }
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(downloadHandle_))); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  LONG lUserID_;
+  int channel_;
+  int64_t beginMs_;
+  int64_t endMs_;
+  std::string saveFilePath_;
+  POINTERHANDLE downloadHandle_ = -1;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value StartBackup(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
+  const int channel = info[1].As<Napi::Number>().Int32Value();
+  const int64_t beginMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
+  const int64_t endMs = static_cast<int64_t>(info[3].As<Napi::Number>().DoubleValue());
+  const std::string saveFilePath = info[4].As<Napi::String>().Utf8Value();
+
+  const LONG lUserID = std::stol(sessionId);
+  auto* worker = new StartBackupWorker(env, lUserID, channel, beginMs, endMs, saveFilePath);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+// Unlike Uniview (which has to compute a percentage itself, polling a
+// generic playtime control against the original requested range),
+// NET_SDK_GetDownloadPos directly returns 0-100 - much simpler. -1 (failure)
+// is treated as "done" (matching Uniview's same convention: a failed poll
+// against a download handle reliably means the transfer already finished
+// and the SDK released its internal state, confirmed via that SDK's own
+// demo). 200 (the SDK's own "network anomaly" signal, per its doc comment)
+// is clamped down to 100 too, since the renderer only needs progress
+// polling to eventually stop - not implemented as a way to actually surface
+// a network error mid-download.
+class GetBackupProgressWorker : public Napi::AsyncWorker {
+ public:
+  GetBackupProgressWorker(Napi::Env env, POINTERHANDLE downloadHandle)
+      : Napi::AsyncWorker(env), downloadHandle_(downloadHandle), deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    const int pos = NET_SDK_GetDownloadPos(downloadHandle_);
+    if (pos < 0 || pos > 100) {
+      percent_ = 100;
+    } else {
+      percent_ = pos;
+    }
+  }
+
+  void OnOK() override { deferred_.Resolve(Napi::Number::New(Env(), percent_)); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  POINTERHANDLE downloadHandle_;
+  double percent_ = 0;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value GetBackupProgress(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const POINTERHANDLE downloadHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
+  auto* worker = new GetBackupProgressWorker(env, downloadHandle);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+class StopBackupWorker : public Napi::AsyncWorker {
+ public:
+  StopBackupWorker(Napi::Env env, POINTERHANDLE downloadHandle)
+      : Napi::AsyncWorker(env), downloadHandle_(downloadHandle), deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override { NET_SDK_StopGetFile(downloadHandle_); }
+
+  void OnOK() override { deferred_.Resolve(Env().Undefined()); }
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  POINTERHANDLE downloadHandle_;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value StopBackup(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const POINTERHANDLE downloadHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
+  auto* worker = new StopBackupWorker(env, downloadHandle);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
+}
+
+// Device discovery — NET_SDK_DiscoverDevice, a genuine UDP broadcast the
+// device itself answers, no login/credentials involved. NOTE: the SDK
+// header also documents a multi-vendor search (NET_SDK_DiscoverDeviceStart
+// with a SearchTypeMask covering TVT's own protocol plus ONVIF/UPnP plus
+// emulated Dahua/Hikvision/Uniview protocols all at once) that looked like
+// it could cover every vendor through one call - confirmed NOT actually
+// usable, though: it's declared behind `#ifdef DVR_NET_SDK_EXPORTS` in
+// DVR_NET_SDK.h, a macro only defined when TVT builds the SDK's own DLL
+// internally, not by a third-party consumer - the linker can't find it in
+// the .lib we were given ("identifier not found"), so it's effectively an
+// internal-only symbol despite being visible in the header. This function
+// is the one that's actually exported and callable; it only finds TVT's
+// own devices, same scope as every other vendor's discovery in this
+// project (no multi-vendor coverage from a single call after all).
+//
+// A single blocking call with its own internal wait, unlike
+// Uniview's/Dahua's callback-based discovery - runs on an AsyncWorker
+// (same reasoning as LoginWorker above: a blocking SDK call would freeze
+// Electron's main thread otherwise), no manual start/stop/timer needed.
+constexpr int kDiscoveryMaxRecords = 256;
+constexpr int kDiscoveryWaitSeconds = 3;
+
+std::string SafeFieldString(const char* field, size_t fieldSize) {
+  return std::string(field, strnlen(field, fieldSize));
+}
+
+std::string FormatMac(const unsigned char* mac) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return std::string(buf);
+}
+
+class DiscoverDevicesWorker : public Napi::AsyncWorker {
+ public:
+  explicit DiscoverDevicesWorker(Napi::Env env) : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)) {}
+
+  void Execute() override {
+    devices_.resize(kDiscoveryMaxRecords);
+    const int count = NET_SDK_DiscoverDevice(devices_.data(), kDiscoveryMaxRecords, kDiscoveryWaitSeconds);
+    devices_.resize(count > 0 ? static_cast<size_t>(count) : 0);
+  }
+
+  void OnOK() override {
+    Napi::Env env = Env();
+    Napi::Array result = Napi::Array::New(env);
+    for (size_t i = 0; i < devices_.size(); ++i) {
+      const auto& d = devices_[i];
+      Napi::Object obj = Napi::Object::New(env);
+      obj.Set("host", SafeFieldString(d.strIP, sizeof(d.strIP)));
+      obj.Set("port", Napi::Number::New(env, d.netPort));
+      obj.Set("httpPort", Napi::Number::New(env, d.httpPort));
+      obj.Set("mac", FormatMac(d.byMac));
+      obj.Set("model", SafeFieldString(d.productType, sizeof(d.productType)));
+      obj.Set("name", SafeFieldString(d.devName, sizeof(d.devName)));
+      result[static_cast<uint32_t>(i)] = obj;
+    }
+    deferred_.Resolve(result);
+  }
+
+  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+  Napi::Promise GetPromise() { return deferred_.Promise(); }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  std::vector<NET_SDK_DEVICE_DISCOVERY_INFO> devices_;
+};
+
+Napi::Value DiscoverDevices(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  auto* worker = new DiscoverDevicesWorker(env);
+  Napi::Promise promise = worker->GetPromise();
+  worker->Queue();
+  return promise;
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -309,6 +1052,16 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("logout", Napi::Function::New(env, Logout));
   exports.Set("startLiveView", Napi::Function::New(env, StartLiveView));
   exports.Set("stopLiveView", Napi::Function::New(env, StopLiveView));
+  exports.Set("setFrameDelivery", Napi::Function::New(env, SetFrameDelivery));
+  exports.Set("findRecordings", Napi::Function::New(env, FindRecordings));
+  exports.Set("startPlayback", Napi::Function::New(env, StartPlayback));
+  exports.Set("controlPlayback", Napi::Function::New(env, ControlPlayback));
+  exports.Set("getPlaybackTime", Napi::Function::New(env, GetPlaybackTime));
+  exports.Set("stopPlayback", Napi::Function::New(env, StopPlayback));
+  exports.Set("startBackup", Napi::Function::New(env, StartBackup));
+  exports.Set("getBackupProgress", Napi::Function::New(env, GetBackupProgress));
+  exports.Set("stopBackup", Napi::Function::New(env, StopBackup));
+  exports.Set("discoverDevices", Napi::Function::New(env, DiscoverDevices));
   return exports;
 }
 

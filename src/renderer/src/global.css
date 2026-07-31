@@ -1,3 +1,68 @@
+/* Light/dark palettes as CSS custom properties, switched by the
+   data-theme attribute on <html> (see theme.ts / applyThemeMode). Every
+   component reads these through the theme.ts object (theme.text ->
+   var(--text), etc.) rather than importing separate light/dark objects —
+   many components define their style objects at module scope (outside any
+   component function), so a React-context/hook-based swap would have
+   required moving all of those inside component bodies across ~15 files.
+   CSS variables repaint instantly on toggle with no React re-render at
+   all, and don't care whether the value was read inside or outside a
+   component. The brand navy accent colors stay the same in both palettes
+   - only backgrounds/borders/text tones flip. */
+:root,
+:root[data-theme='dark'] {
+  --bg: #0a0e13;
+  --panel: #12181f;
+  --surface: #1a212b;
+  --surface-hover: #212a35;
+  --border: #232b36;
+  --border-light: #2e3947;
+  --text: #e8edf2;
+  --text-muted: #8b98a5;
+  --text-faint: #5a6672;
+  --accent: #00007f;
+  --accent-hover: #1a1aa8;
+  --accent-pressed: #00005c;
+  --accent-text: #ffffff;
+  --accent-faint: rgba(26, 26, 168, 0.18);
+  --accent-glow: rgba(26, 26, 168, 0.14);
+  /* Selection outline (Live View tile highlight) - kept identical to the
+     navy accent in dark mode since that's already proven visible there. */
+  --selection: #00007f;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --success: #22c55e;
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --surface: #f0f1f4;
+  --surface-hover: #e5e7eb;
+  --border: #dde1e6;
+  --border-light: #c9cfd6;
+  --text: #171b21;
+  --text-muted: #565f6b;
+  --text-faint: #8a94a1;
+  --accent: #00007f;
+  --accent-hover: #1a1aa8;
+  --accent-pressed: #00005c;
+  --accent-text: #ffffff;
+  --accent-faint: rgba(0, 0, 127, 0.1);
+  --accent-glow: rgba(0, 0, 127, 0.08);
+  /* Navy is too dark to read reliably against a black video tile once
+     the eye is calibrated to a bright light-mode UI - confirmed live:
+     the selected-tile outline was effectively invisible. A brighter,
+     more saturated blue keeps it clearly on-brand while actually standing
+     out against black regardless of how bright the rest of the UI is. */
+  --selection: #2f6fed;
+  --danger: #dc2626;
+  --warning: #d97706;
+  --success: #16a34a;
+  color-scheme: light;
+}
+
 * {
   box-sizing: border-box;
 }

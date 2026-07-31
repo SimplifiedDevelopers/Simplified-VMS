@@ -15,23 +15,29 @@ const DEFAULT_PORTS: Record<VendorId, number> = {
   uniview: 80,
   hikvision: 8000,
   dahua: 37777,
+  onvif: 80,
 };
 
-const SUPPORTED_VENDORS = new Set<VendorId>(['hikvision', 'uniview', 'dahua', 'tvt']);
+const SUPPORTED_VENDORS = new Set<VendorId>(['hikvision', 'uniview', 'dahua', 'tvt', 'onvif']);
 
 interface Props {
   initial: StoredDevice | null;
+  // Seeds the Add-Device form's fields from a network-discovered device
+  // (see DeviceManagement's discovery section) without switching the dialog
+  // into edit mode — title, password requirement, and submit label all
+  // still behave as a normal "Add", only ignored when `initial` is set.
+  prefill?: Partial<NewDeviceInput>;
   onSave: (input: NewDeviceInput) => Promise<void>;
   onCancel: () => void;
 }
 
-export function DeviceDialog({ initial, onSave, onCancel }: Props) {
-  const [vendor, setVendor] = useState<VendorId>(initial?.vendor ?? 'hikvision');
-  const [name, setName] = useState(initial?.name ?? '');
-  const [host, setHost] = useState(initial?.host ?? '');
-  const [port, setPort] = useState(String(initial?.port ?? DEFAULT_PORTS[vendor]));
-  const [httpPort, setHttpPort] = useState(String(initial?.httpPort ?? 80));
-  const [username, setUsername] = useState(initial?.username ?? 'admin');
+export function DeviceDialog({ initial, prefill, onSave, onCancel }: Props) {
+  const [vendor, setVendor] = useState<VendorId>(initial?.vendor ?? prefill?.vendor ?? 'uniview');
+  const [name, setName] = useState(initial?.name ?? prefill?.name ?? '');
+  const [host, setHost] = useState(initial?.host ?? prefill?.host ?? '');
+  const [port, setPort] = useState(String(initial?.port ?? prefill?.port ?? DEFAULT_PORTS[vendor]));
+  const [httpPort, setHttpPort] = useState(String(initial?.httpPort ?? prefill?.httpPort ?? 80));
+  const [username, setUsername] = useState(initial?.username ?? prefill?.username ?? 'admin');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -68,6 +74,18 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
     setError(null);
     if (!name.trim() || !host.trim()) {
       setError('Device name and IP/Domain are required.');
+      return;
+    }
+    // Only enforced for a brand-new device — editing an existing one
+    // legitimately leaves this blank to keep the current password (see the
+    // field's own placeholder). Added after a real report from the field:
+    // devices added from the network-scan list have every field pre-filled
+    // except this one (discovery has no way to know a device's password),
+    // and nothing stopped saving with it still blank — the device would
+    // then silently fail to ever connect with a credentials error, easy to
+    // miss since everything else on the form already looked "filled in".
+    if (!initial && !password.trim()) {
+      setError('Password is required.');
       return;
     }
     setBusy(true);
@@ -114,7 +132,7 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
                       padding: '0.45rem 0',
                       borderRadius: '5px',
                       border: `1px solid ${active ? theme.accent : theme.border}`,
-                      background: active ? `${theme.accent}1f` : theme.surface,
+                      background: active ? theme.accentFaint : theme.surface,
                       color: active ? theme.accentHover : theme.textMuted,
                       fontSize: '12.5px',
                       fontWeight: 600,
@@ -139,6 +157,12 @@ export function DeviceDialog({ initial, onSave, onCancel }: Props) {
           </Field>
           <Field label="Service Port">
             <input value={port} onChange={(e) => setPort(e.target.value)} style={inputStyle} />
+            {prefill && !initial && (
+              <span style={{ fontSize: '10.5px', color: theme.warning }}>
+                Guessed default for this vendor — network discovery can't detect a device's actual configured SDK
+                port. Verify this matches your device's settings before saving.
+              </span>
+            )}
           </Field>
           <Field label="HTTP Port (for Open in Browser)">
             <input value={httpPort} onChange={(e) => setHttpPort(e.target.value)} style={inputStyle} />

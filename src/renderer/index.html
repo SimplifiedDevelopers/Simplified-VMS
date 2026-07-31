@@ -4,12 +4,113 @@
     <meta charset="UTF-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://*.broadvoice.com; connect-src 'self' https://*.broadvoice.com wss://*.broadvoice.com; frame-src https://*.broadvoice.com; img-src 'self' data: https://*.broadvoice.com; style-src 'self' 'unsafe-inline' https://*.broadvoice.com; font-src 'self' https://*.broadvoice.com"
     />
-    <title>SSM VMS</title>
+    <title>Simplified VMS</title>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="./src/main.tsx"></script>
+
+    <!-- Start Pidj Chat Code (get yours at https://bubble.broadvoice.com) -->
+    <script type="text/javascript">
+    (function() {
+    var pc = document.createElement('script'); pc.type = 'text/javascript'; pc.async = true;
+    pc.src = 'https://bubble.broadvoice.com/chat/button/pc:20e048a5-22ce-5022-b786-1fc5341ee40c:aDxza.js?t=' + Date.now() + '';
+    var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(pc, s);
+    })();
+    </script>
+    <!-- End Pidj Chat Code -->
+
+    <!-- Chat teaser bubble - replaces Broadvoice's own default floating icon
+         entirely (hidden below) with our own branded widget in the same
+         corner. Clicking it (in either its full-message or collapsed-icon
+         state) still opens the real chat via window.PidjOpener.Open(), so
+         nothing about the actual chat session depends on Broadvoice's icon
+         being visible. -->
+    <script type="text/javascript">
+    (function() {
+      // AppShell (React) calls window.setChatWidgetVisible(bool) whenever
+      // the active tab changes, so the widget only shows on the Home page
+      // rather than everywhere in the app. `visible` remembers the desired
+      // state even before the widget itself has finished loading (Broadvoice's
+      // script is fetched async), and defaults to true since Home is the
+      // app's initial tab.
+      var visible = true;
+      var wrapper = null;
+      window.setChatWidgetVisible = function(v) {
+        visible = v;
+        if (wrapper) wrapper.style.display = visible ? 'block' : 'none';
+      };
+
+      function addChatTeaser() {
+        var opener = document.getElementById('pidj-opener');
+        if (!opener) return false;
+        opener.style.display = 'none';
+
+        wrapper = document.createElement('div');
+        wrapper.style.display = visible ? 'block' : 'none';
+        document.body.appendChild(wrapper);
+
+        var teaser = document.createElement('div');
+        teaser.onclick = function() {
+          if (window.PidjOpener) window.PidjOpener.Open();
+        };
+
+        function showMessage() {
+          teaser.style.cssText = 'position: fixed; bottom: 32px; right: 20px; width: 250px; ' +
+            'background: #00007f; color: #fff; border-radius: 12px; padding: 14px 30px 14px 16px; ' +
+            'font-family: system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.45; ' +
+            'box-shadow: 0 4px 16px rgba(0,0,0,0.3); cursor: pointer; opacity: 0; ' +
+            'transition: opacity 2s linear; z-index: 2147483646;';
+          teaser.innerHTML =
+            '<div style="font-weight:700; font-size:14px; margin-bottom:6px;">Need help? Chat with us</div>' +
+            '<div>We are here to help.<br />Mon-Fri 9am-5pm</div>';
+
+          var closeBtn = document.createElement('button');
+          closeBtn.textContent = String.fromCharCode(215);
+          closeBtn.style.cssText = 'position: absolute; top: 6px; right: 8px; background: none; ' +
+            'border: none; color: #fff; opacity: 0.7; font-size: 14px; line-height: 1; cursor: pointer; padding: 4px;';
+          closeBtn.onclick = function(event) {
+            event.stopPropagation();
+            showIcon();
+          };
+          teaser.appendChild(closeBtn);
+
+          // Speech-bubble tail, like the reference image - a CSS-triangle
+          // pointer attached near the bottom-left corner of the box.
+          var tail = document.createElement('div');
+          tail.style.cssText = 'position: absolute; bottom: -10px; left: 24px; width: 0; height: 0; ' +
+            'border-left: 4px solid transparent; border-right: 18px solid transparent; ' +
+            'border-top: 14px solid #00007f;';
+          teaser.appendChild(tail);
+
+          setTimeout(function() {
+            teaser.style.opacity = 1;
+          }, 250);
+        }
+
+        function showIcon() {
+          teaser.style.cssText = 'position: fixed; bottom: 20px; right: 20px; width: 56px; height: 56px; ' +
+            'background: #00007f; color: #fff; border-radius: 50%; display: flex; align-items: center; ' +
+            'justify-content: center; box-shadow: 0 4px 16px rgba(0,0,0,0.3); cursor: pointer; ' +
+            'opacity: 1; z-index: 2147483646;';
+          teaser.innerHTML =
+            '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">' +
+            '<path d="M4 4h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H8l-4.5 4V6a1 1 0 0 1 1-1z"/></svg>';
+        }
+
+        wrapper.appendChild(teaser);
+        showMessage();
+        return true;
+      }
+
+      if (addChatTeaser()) return;
+      var observer = new MutationObserver(function() {
+        if (addChatTeaser()) observer.disconnect();
+      });
+      observer.observe(document.body, { childList: true });
+    })();
+    </script>
   </body>
 </html>

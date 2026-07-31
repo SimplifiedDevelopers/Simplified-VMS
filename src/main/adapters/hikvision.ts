@@ -1,6 +1,14 @@
 import { join } from 'path';
 import { app } from 'electron';
-import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../../shared/types';
+import type {
+  DecodedFrame,
+  DeviceSession,
+  LoginParams,
+  PlaybackCommand,
+  RecordingSearchFilter,
+  RecordingSegment,
+  StreamType,
+} from '../../shared/types';
 import type { VmsAdapter } from './vmsAdapter';
 
 interface NativeFrame {
@@ -9,6 +17,12 @@ interface NativeFrame {
   format: 'rgb32';
   timestampMs: number;
   data: Buffer;
+}
+
+interface NativeRecordingSegment {
+  startMs: number;
+  endMs: number;
+  type: string;
 }
 
 interface NativeAddon {
@@ -25,7 +39,29 @@ interface NativeAddon {
     streamType: StreamType,
     onFrame: (frame: NativeFrame) => void,
   ): Promise<string>;
-  stopLiveView(viewHandle: string): void;
+  stopLiveView(viewHandle: string): Promise<void>;
+  setFrameDelivery(viewHandle: string, enabled: boolean): void;
+
+  findRecordings(
+    sessionId: string,
+    channel: number,
+    startMs: number,
+    endMs: number,
+    filters: RecordingSearchFilter[],
+  ): Promise<NativeRecordingSegment[]>;
+  startPlayback(
+    sessionId: string,
+    channel: number,
+    startMs: number,
+    endMs: number,
+    onFrame: (frame: NativeFrame) => void,
+  ): Promise<string>;
+  controlPlayback(viewHandle: string, command: PlaybackCommand, value?: number): Promise<void>;
+  getPlaybackTime(viewHandle: string): Promise<number>;
+  stopPlayback(viewHandle: string): Promise<void>;
+  startBackup(sessionId: string, channel: number, startMs: number, endMs: number, saveFilePath: string): Promise<string>;
+  getBackupProgress(downloadHandle: string): Promise<number>;
+  stopBackup(downloadHandle: string): Promise<void>;
 }
 
 let cachedNative: NativeAddon | null = null;
@@ -77,6 +113,75 @@ export class HikvisionAdapter implements VmsAdapter {
   }
 
   async stopLiveView(viewHandle: string): Promise<void> {
-    loadNative().stopLiveView(viewHandle);
+    // Now a real native AsyncWorker (see the addon's own doc comment) —
+    // properly awaited/returned instead of fire-and-forget, so a genuinely
+    // hung stop call surfaces as this promise never resolving instead of
+    // silently freezing the whole app on Electron's main thread.
+    return loadNative().stopLiveView(viewHandle);
+  }
+
+  async setFrameDelivery(viewHandle: string, enabled: boolean): Promise<void> {
+    loadNative().setFrameDelivery(viewHandle, enabled);
+  }
+
+  async findRecordings(
+    sessionId: string,
+    channel: number,
+    startMs: number,
+    endMs: number,
+    filters: RecordingSearchFilter[],
+    // Only Uniview's search is expensive enough to need a quick/full split
+    // (see VmsAdapter.findRecordings' doc comment) - accepted here purely to
+    // satisfy the shared interface, unused.
+    _quick?: boolean,
+  ): Promise<RecordingSegment[]> {
+    const segments = await loadNative().findRecordings(sessionId, channel, startMs, endMs, filters);
+    return segments.map((seg) => ({
+      startMs: seg.startMs,
+      endMs: seg.endMs,
+      type: seg.type === 'continuous' || seg.type === 'motion' || seg.type === 'smart' ? seg.type : 'other',
+    }));
+  }
+
+  async startPlayback(
+    sessionId: string,
+    channel: number,
+    startMs: number,
+    endMs: number,
+    onFrame: (frame: DecodedFrame) => void,
+  ): Promise<string> {
+    return loadNative().startPlayback(sessionId, channel, startMs, endMs, (frame) => {
+      onFrame({
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        data: frame.data,
+        timestampMs: frame.timestampMs,
+      });
+    });
+  }
+
+  async controlPlayback(viewHandle: string, command: PlaybackCommand, value?: number): Promise<void> {
+    return loadNative().controlPlayback(viewHandle, command, value);
+  }
+
+  async getPlaybackTime(viewHandle: string): Promise<number> {
+    return loadNative().getPlaybackTime(viewHandle);
+  }
+
+  async stopPlayback(viewHandle: string): Promise<void> {
+    return loadNative().stopPlayback(viewHandle);
+  }
+
+  async startBackup(sessionId: string, channel: number, startMs: number, endMs: number, saveFilePath: string): Promise<string> {
+    return loadNative().startBackup(sessionId, channel, startMs, endMs, saveFilePath);
+  }
+
+  async getBackupProgress(downloadHandle: string): Promise<number> {
+    return loadNative().getBackupProgress(downloadHandle);
+  }
+
+  async stopBackup(downloadHandle: string): Promise<void> {
+    return loadNative().stopBackup(downloadHandle);
   }
 }

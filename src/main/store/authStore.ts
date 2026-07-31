@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { app } from 'electron';
 
-interface AuthFile {
+export interface AuthFile {
   username: string;
   salt: string;
   hash: string;
@@ -46,4 +46,16 @@ export function verifyLogin(username: string, password: string): boolean {
   const expected = Buffer.from(account.hash, 'hex');
   const actual = hashPassword(password, salt);
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+// For Backup/Restore Configuration (see ipc/backup.ts) — the stored
+// scrypt hash+salt is portable as-is (unlike device/login passwords, it's
+// never decrypted, just compared against on login, so it isn't tied to this
+// machine's DPAPI key the way safeStorage-encrypted values are).
+export function getAdminAccountRaw(): AuthFile | null {
+  return readAuthFile();
+}
+
+export function restoreAdminAccount(data: AuthFile): void {
+  writeAuthFile(data);
 }

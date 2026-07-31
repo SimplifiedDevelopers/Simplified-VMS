@@ -1,6 +1,6 @@
 {
   "name": "ssm-vms",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "description": "Unified multi-vendor VMS desktop client (Hikvision, Dahua, TVT, Uniview)",
   "private": true,
   "main": "./out/main/index.js",
@@ -14,9 +14,13 @@
     "build:unv-native": "npm run build --prefix native/uniview",
     "build:dahua-native": "npm run build --prefix native/dahua",
     "build:tvt-native": "npm run build --prefix native/tvt",
-    "dist:win": "npm run build && electron-builder --win"
+    "dist:win": "npm run build && electron-builder --win",
+    "release:win": "npm run build && electron-builder --win --publish always"
   },
   "dependencies": {
+    "electron-updater": "^6.3.9",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
     "node-addon-api": "^8.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
