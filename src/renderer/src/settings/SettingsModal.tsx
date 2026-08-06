@@ -342,42 +342,6 @@ function VideoSection() {
         </div>
       </SettingsField>
 
-      <SettingsField label="Video Backup Path">
-        <div style={{ display: 'flex', gap: '0.5rem' }}>
-          <input
-            value={settings.exportPath}
-            readOnly
-            placeholder="Not set"
-            style={{
-              flex: 1,
-              padding: '0.5rem 0.6rem',
-              borderRadius: '5px',
-              border: `1px solid ${theme.border}`,
-              background: theme.surface,
-              color: theme.text,
-              fontSize: '12.5px',
-              outline: 'none',
-            }}
-          />
-          <button
-            onClick={handleBrowseExport}
-            disabled={browsingExport}
-            style={{
-              padding: '0.45rem 0.9rem',
-              borderRadius: '5px',
-              border: `1px solid ${theme.borderLight}`,
-              background: 'transparent',
-              color: theme.text,
-              fontSize: '12.5px',
-              cursor: 'pointer',
-              flexShrink: 0,
-            }}
-          >
-            {browsingExport ? 'Choosing…' : 'Browse'}
-          </button>
-        </div>
-      </SettingsField>
-
       <SettingsField label="Local Recording Path">
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <input
@@ -410,6 +374,42 @@ function VideoSection() {
             }}
           >
             {browsingLocalRecording ? 'Choosing…' : 'Browse'}
+          </button>
+        </div>
+      </SettingsField>
+
+      <SettingsField label="Video Backup Path">
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <input
+            value={settings.exportPath}
+            readOnly
+            placeholder="Not set"
+            style={{
+              flex: 1,
+              padding: '0.5rem 0.6rem',
+              borderRadius: '5px',
+              border: `1px solid ${theme.border}`,
+              background: theme.surface,
+              color: theme.text,
+              fontSize: '12.5px',
+              outline: 'none',
+            }}
+          />
+          <button
+            onClick={handleBrowseExport}
+            disabled={browsingExport}
+            style={{
+              padding: '0.45rem 0.9rem',
+              borderRadius: '5px',
+              border: `1px solid ${theme.borderLight}`,
+              background: 'transparent',
+              color: theme.text,
+              fontSize: '12.5px',
+              cursor: 'pointer',
+              flexShrink: 0,
+            }}
+          >
+            {browsingExport ? 'Choosing…' : 'Browse'}
           </button>
         </div>
       </SettingsField>
@@ -555,7 +555,7 @@ function AboutSection() {
       <div style={{ fontSize: '15px', fontWeight: 700, color: theme.text }}>Simplified VMS</div>
       <div style={{ fontSize: '12.5px', color: theme.textMuted }}>Version {version ?? '—'}</div>
       <div style={{ fontSize: '11.5px', color: theme.textFaint, marginTop: '0.3rem', lineHeight: 1.5 }}>
-        Unified multi-vendor video management.
+        Unified Multi-Vendor Video Management.
         <br />
         © {new Date().getFullYear()} Simplified Developers
       </div>

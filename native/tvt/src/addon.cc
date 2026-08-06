@@ -16,11 +16,13 @@
 #include <napi.h>
 #include <windows.h>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -347,7 +349,20 @@ class StartLiveViewWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
+    // Diagnostic: reported live that a TVT backup download hangs with
+    // zero console output - the existing per-call diagnostics only ever
+    // print AFTER acquiring this session's shared mutex, so a hang while
+    // WAITING for it (e.g. another still-running call for the same
+    // session never released it) would look identical to "nothing
+    // happened at all." Logging both sides of every mutex acquisition
+    // across every TVT worker that touches it, tagged per call site, to
+    // see which one is actually holding/waiting on the lock next time.
+    fprintf(stderr, "[tvt-lock-diag] StartLiveView ch=%d waiting for session lock...\n", channel_);
+    fflush(stderr);
+    const ULONGLONG tEnter = GetTickCount64();
     std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+    fprintf(stderr, "[tvt-lock-diag] StartLiveView ch=%d got lock after %llums\n", channel_, GetTickCount64() - tEnter);
+    fflush(stderr);
 
     NET_SDK_CLIENTINFO clientInfo = {};
     clientInfo.lChannel = channel_;
@@ -454,7 +469,12 @@ class StopLiveViewWorker : public Napi::AsyncWorker {
       // hardware freeze testing on the Uniview vendor; applied here for
       // consistency even though this exact freeze was only reproduced on
       // Uniview so far.
+      fprintf(stderr, "[tvt-lock-diag] StopLiveView waiting for session lock...\n");
+      fflush(stderr);
+      const ULONGLONG tEnter = GetTickCount64();
       std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session->lUserID));
+      fprintf(stderr, "[tvt-lock-diag] StopLiveView got lock after %llums\n", GetTickCount64() - tEnter);
+      fflush(stderr);
       DestroySession(session);
     }
   }
@@ -516,7 +536,12 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
+    fprintf(stderr, "[tvt-lock-diag] FindRecordings ch=%d waiting for session lock...\n", channel_);
+    fflush(stderr);
+    const ULONGLONG tEnter = GetTickCount64();
     std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
+    fprintf(stderr, "[tvt-lock-diag] FindRecordings ch=%d got lock after %llums\n", channel_, GetTickCount64() - tEnter);
+    fflush(stderr);
 
     DD_TIME begin = EpochMsToDdTime(beginMs_);
     DD_TIME end = EpochMsToDdTime(endMs_);
@@ -629,7 +654,12 @@ class StartPlaybackWorker : public Napi::AsyncWorker {
   }
 
   void Execute() override {
+    fprintf(stderr, "[tvt-lock-diag] StartPlayback ch=%d waiting for session lock...\n", channel_);
+    fflush(stderr);
+    const ULONGLONG tEnter = GetTickCount64();
     std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(session_->lUserID));
+    fprintf(stderr, "[tvt-lock-diag] StartPlayback ch=%d got lock after %llums\n", channel_, GetTickCount64() - tEnter);
+    fflush(stderr);
 
     DD_TIME begin = EpochMsToDdTime(beginMs_);
     DD_TIME end = EpochMsToDdTime(endMs_);
@@ -846,46 +876,244 @@ Napi::Value StopPlayback(const Napi::CallbackInfo& info) {
   return promise;
 }
 
-class StartBackupWorker : public Napi::AsyncWorker {
- public:
-  StartBackupWorker(Napi::Env env, LONG lUserID, int channel, int64_t beginMs, int64_t endMs,
-                     std::string saveFilePath)
-      : Napi::AsyncWorker(env),
-        lUserID_(lUserID),
-        channel_(channel),
-        beginMs_(beginMs),
-        endMs_(endMs),
-        saveFilePath_(std::move(saveFilePath)),
-        deferred_(Napi::Promise::Deferred::New(env)) {}
+// Finds the real file record (from NET_SDK_FindFile/FindNextFile, same
+// search FindRecordingsWorker above already uses) overlapping the
+// requested range, and returns its exact startTime/stopTime. The vendor's
+// own demo (SDKDEMO/BackupDlg.cpp) never passes an arbitrary range at all
+// to a backup call, only a real file's own exact boundaries - snapping to
+// those first was step one of diagnosing the 0-byte export bug below (it
+// alone did not fix it, but stays: it's still a closer match to the
+// vendor's own usage than an arbitrary clip-marker range, and is cheap).
+bool FindContainingFile(LONG lUserID, int channel, int64_t targetBeginMs, int64_t targetEndMs, DD_TIME* outBegin,
+                         DD_TIME* outEnd) {
+  DD_TIME searchBegin = EpochMsToDdTime(targetBeginMs);
+  DD_TIME searchEnd = EpochMsToDdTime(targetEndMs);
+  const POINTERHANDLE hFind = NET_SDK_FindFile(lUserID, channel, &searchBegin, &searchEnd);
+  if (hFind == -1) return false;
 
-  void Execute() override {
-    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
-
-    DD_TIME begin = EpochMsToDdTime(beginMs_);
-    DD_TIME end = EpochMsToDdTime(endMs_);
-
-    downloadHandle_ =
-        NET_SDK_GetFileByTime(lUserID_, channel_, &begin, &end, const_cast<char*>(saveFilePath_.c_str()));
-    if (downloadHandle_ == -1) {
-      const DWORD err = NET_SDK_GetLastError();
-      SetError("NET_SDK_GetFileByTime failed (error " + std::to_string(err) + ")");
-    }
+  bool found = false;
+  NET_SDK_REC_FILE fileInfo = {};
+  const LONG ret = NET_SDK_FindNextFile(hFind, &fileInfo);
+  if (ret == NET_SDK_FILE_SUCCESS) {
+    *outBegin = fileInfo.startTime;
+    *outEnd = fileInfo.stopTime;
+    found = true;
   }
+  NET_SDK_FindClose(hFind);
+  return found;
+}
 
-  void OnOK() override { deferred_.Resolve(Napi::String::New(Env(), std::to_string(downloadHandle_))); }
-  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
-  Napi::Promise GetPromise() { return deferred_.Promise(); }
-
- private:
-  LONG lUserID_;
-  int channel_;
-  int64_t beginMs_;
-  int64_t endMs_;
-  std::string saveFilePath_;
-  POINTERHANDLE downloadHandle_ = -1;
-  Napi::Promise::Deferred deferred_;
+// Real per-download state, updated only by RunTvtDownload's own dedicated
+// thread (see below) and read by GetBackupProgress/StopBackup - atomics
+// instead of a mutex since every field is a single scalar with no
+// cross-field invariant to protect.
+struct TvtDownloadState {
+  std::atomic<int> percent{0};
+  std::atomic<bool> done{false};
+  std::atomic<bool> failed{false};
+  std::atomic<bool> stopRequested{false};
 };
 
+std::mutex g_tvtDownloadsMutex;
+std::unordered_map<std::string, std::shared_ptr<TvtDownloadState>> g_tvtDownloads;
+std::atomic<int64_t> g_tvtDownloadCounter{0};
+
+// Context for TvtBackupDataCallback below - one per in-flight download,
+// owned by RunTvtDownload's stack frame for the download's whole lifetime.
+struct TvtCallbackContext {
+  FILE* file = nullptr;
+  std::mutex fileMutex;  // guards fwrite in case the SDK calls back from more than one internal thread
+  int channel = 0;
+  std::atomic<int64_t> totalBytes{0};
+  std::atomic<int> callCount{0};
+};
+
+// Decisive test for whether any real data ever reaches this process at all:
+// bUseCallBack=FALSE (the vendor demo's own default, and everything tried
+// so far) asks the SDK to write the file itself, silently, with no way to
+// observe whether real bytes ever moved - only the time-based
+// GetDownloadPos estimate, which climbs to "complete" regardless. This
+// callback mode hands us the raw bytes directly as the SDK receives them,
+// so counting real invocations/bytes here proves - one way or the other -
+// whether the 0-byte result is a network/device-side problem (callback
+// never fires) or purely a bug in the SDK's own silent file-write path
+// (callback fires with real data, and writing it ourselves produces a real
+// file).
+void CALLBACK TvtBackupDataCallback(POINTERHANDLE lFileHandle, UINT dataType, BYTE* pBuffer, UINT dataLen,
+                                     void* pUser) {
+  auto* ctx = static_cast<TvtCallbackContext*>(pUser);
+  const int n = ctx->callCount.fetch_add(1);
+  if (n < 8) {
+    fprintf(stderr, "[tvt-backup-diag] ch=%d callback #%d dataType=%u dataLen=%u\n", ctx->channel, n,
+            static_cast<unsigned>(dataType), static_cast<unsigned>(dataLen));
+    fflush(stderr);
+  }
+
+  if (dataType == NET_DVR_BACKUP_DATA_TYPE_NULL) {
+    const int status = (pBuffer && dataLen >= sizeof(int)) ? *reinterpret_cast<int*>(pBuffer) : -1;
+    fprintf(stderr,
+            "[tvt-backup-diag] ch=%d callback status-frame status=%d (0=STOP,1=END) totalBytes=%lld "
+            "callCount=%d\n",
+            ctx->channel, status, static_cast<long long>(ctx->totalBytes.load()), ctx->callCount.load());
+    fflush(stderr);
+    return;
+  }
+
+  if (pBuffer && dataLen > 0 && ctx->file) {
+    std::lock_guard<std::mutex> lock(ctx->fileMutex);
+    fwrite(pBuffer, 1, dataLen, ctx->file);
+    ctx->totalBytes += dataLen;
+  }
+}
+
+// Root cause of the 0-byte export bug, found by comparing real behavior
+// against NET_SDK_GetDownloadPos's own doc comment: its "progress" is
+// computed purely from wall-clock time elapsed vs. the requested file's
+// own duration ("进度=（当前下载到的时间-文件开始时间）/（文件结束时间-文件开始
+// 时间）") - it is NEVER based on actual bytes received. That explains why
+// every earlier fix attempt (arbitrary range, exact file boundary, legacy
+// GetFileByTime vs the V2 API, explicitly finalizing via StopGetFile once
+// "complete") produced the identical result: GetDownloadPos confidently
+// reporting done while the file stayed permanently 0 bytes, confirmed
+// directly on disk (not just via the app's own progress UI) across many
+// separate attempts on multiple channels.
+//
+// This SDK family (TVT/Hikvision/Dahua-derived clones) commonly dispatches
+// socket/backup internals through a hidden window's message queue tied to
+// whichever OS thread made the call - a plain Napi::AsyncWorker runs
+// Execute() on a transient libuv threadpool thread that never pumps
+// Windows messages at all, so if that's what's happening here, the actual
+// data transfer would never be serviced no matter how long it's polled
+// from other calls, while the pure time-based progress estimate would
+// still climb and "complete" on its own regardless.
+//
+// This function owns one download's entire lifecycle on ONE dedicated,
+// persistent OS thread (not the shared libuv threadpool) so that thread can
+// pump its own message queue for as long as the download runs, in case
+// that is what a hidden window created by GetFileByTimeExV2 needs serviced.
+// GetDownloadPos/StopGetFile are called from this SAME thread throughout,
+// never from a separately-dispatched call on a different thread, in case
+// the SDK's internal state is itself thread-affine.
+void RunTvtDownload(LONG lUserID, int channel, int64_t beginMs, int64_t endMs, std::string saveFilePath,
+                     std::shared_ptr<TvtDownloadState> state) {
+  DD_TIME begin = EpochMsToDdTime(beginMs);
+  DD_TIME end = EpochMsToDdTime(endMs);
+  DD_TIME fileBegin{}, fileEnd{};
+
+  TvtCallbackContext ctx;
+  ctx.channel = channel;
+  ctx.file = fopen(saveFilePath.c_str(), "wb");
+  if (!ctx.file) {
+    fprintf(stderr, "[tvt-backup-diag] ch=%d failed to open destination file for writing: %s\n", channel,
+            saveFilePath.c_str());
+    fflush(stderr);
+    state->failed = true;
+    state->done = true;
+    return;
+  }
+
+  POINTERHANDLE handle;
+  {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
+    const bool usedFileBoundary = FindContainingFile(lUserID, channel, beginMs, endMs, &fileBegin, &fileEnd);
+    if (usedFileBoundary) {
+      begin = fileBegin;
+      end = fileEnd;
+    }
+    fprintf(stderr, "[tvt-backup-diag] ch=%d usedFileBoundary=%d path=%s\n", channel, usedFileBoundary ? 1 : 0,
+            saveFilePath.c_str());
+    fflush(stderr);
+
+    // bUseCallBack=TRUE: the SDK hands us raw bytes via TvtBackupDataCallback
+    // as it receives them, instead of silently writing the file itself -
+    // see that callback's doc comment for why. sSavedFileName is still
+    // passed (some SDK builds use it for internal bookkeeping even in
+    // callback mode); the real bytes on disk come entirely from our own
+    // fwrite in the callback now.
+    //
+    // bFirstStream=TRUE (main stream) - deliberate, permanent choice: every
+    // one of this company's DVR/NVR units is configured to record main
+    // stream only wherever the option exists, so main stream is always the
+    // correct (and only real) request regardless of what any one file's
+    // own test result suggested.
+    handle = NET_SDK_GetFileByTimeExV2(lUserID, channel, &begin, &end, const_cast<char*>(saveFilePath.c_str()),
+                                        /*recFormat=*/0, /*bFirstStream=*/TRUE, /*bUseCallBack=*/TRUE,
+                                        /*fBackupDataCallBack=*/TvtBackupDataCallback, /*pUser=*/&ctx);
+  }
+  fprintf(stderr, "[tvt-backup-diag] ch=%d dedicated-thread GetFileByTimeExV2 handle=%lld\n", channel,
+          static_cast<long long>(handle));
+  fflush(stderr);
+  if (handle == -1) {
+    fclose(ctx.file);
+    state->failed = true;
+    state->done = true;
+    return;
+  }
+
+  // Bounded well past any realistic file length so a genuinely stuck
+  // handle can't leak this thread forever, without cutting off a real
+  // multi-minute transfer early.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    // Services any message posted to a hidden window this thread may have
+    // caused the SDK to create - nothing else in the app ever pumps
+    // messages on this thread, since it isn't the Electron main thread and
+    // isn't a normal AsyncWorker thread either.
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&msg);
+      DispatchMessage(&msg);
+    }
+
+    if (state->stopRequested.load()) break;
+
+    int pos;
+    {
+      std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
+      pos = NET_SDK_GetDownloadPos(handle);
+    }
+    fprintf(stderr, "[tvt-backup-diag] ch=%d dedicated-thread handle=%lld GetDownloadPos raw=%d\n", channel,
+            static_cast<long long>(handle), pos);
+    fflush(stderr);
+
+    if (pos < 0 || pos > 100) {
+      state->percent = 100;
+      break;
+    }
+    state->percent = pos;
+    if (pos >= 100) break;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  }
+
+  {
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
+    NET_SDK_StopGetFile(handle);
+  }
+  fclose(ctx.file);
+  fprintf(stderr,
+          "[tvt-backup-diag] ch=%d dedicated-thread handle=%lld finalized totalBytes=%lld callCount=%d\n",
+          channel, static_cast<long long>(handle), static_cast<long long>(ctx.totalBytes.load()),
+          ctx.callCount.load());
+  fflush(stderr);
+  state->percent = 100;
+  state->done = true;
+}
+
+// Only does fast, non-blocking bookkeeping on the calling thread (string
+// alloc + map insert + spawning the detached thread) - every real SDK call
+// happens inside RunTvtDownload on its own dedicated thread above, so this
+// never risks blocking Electron's main thread the way a direct synchronous
+// SDK call here would.
+//
+// Known, narrow residual risk: if the app quits while a download's
+// dedicated thread is still active, that thread isn't tracked by
+// playback.ts's pendingCalls/quitting mechanism (see its own doc comment on
+// the FATAL ERROR napi_throw class that mechanism exists to prevent) since
+// this thread never touches N-API/V8 at all - only the underlying SDK
+// session. The 10-minute bound above and this being a real, human-timed
+// gap (quitting mid-download) rather than a routine race keep this
+// acceptable for now.
 Napi::Value StartBackup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
@@ -893,80 +1121,55 @@ Napi::Value StartBackup(const Napi::CallbackInfo& info) {
   const int64_t beginMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
   const int64_t endMs = static_cast<int64_t>(info[3].As<Napi::Number>().DoubleValue());
   const std::string saveFilePath = info[4].As<Napi::String>().Utf8Value();
-
   const LONG lUserID = std::stol(sessionId);
-  auto* worker = new StartBackupWorker(env, lUserID, channel, beginMs, endMs, saveFilePath);
-  Napi::Promise promise = worker->GetPromise();
-  worker->Queue();
-  return promise;
-}
 
-// Unlike Uniview (which has to compute a percentage itself, polling a
-// generic playtime control against the original requested range),
-// NET_SDK_GetDownloadPos directly returns 0-100 - much simpler. -1 (failure)
-// is treated as "done" (matching Uniview's same convention: a failed poll
-// against a download handle reliably means the transfer already finished
-// and the SDK released its internal state, confirmed via that SDK's own
-// demo). 200 (the SDK's own "network anomaly" signal, per its doc comment)
-// is clamped down to 100 too, since the renderer only needs progress
-// polling to eventually stop - not implemented as a way to actually surface
-// a network error mid-download.
-class GetBackupProgressWorker : public Napi::AsyncWorker {
- public:
-  GetBackupProgressWorker(Napi::Env env, POINTERHANDLE downloadHandle)
-      : Napi::AsyncWorker(env), downloadHandle_(downloadHandle), deferred_(Napi::Promise::Deferred::New(env)) {}
-
-  void Execute() override {
-    const int pos = NET_SDK_GetDownloadPos(downloadHandle_);
-    if (pos < 0 || pos > 100) {
-      percent_ = 100;
-    } else {
-      percent_ = pos;
-    }
+  const std::string myHandle = "tvtdl-" + std::to_string(g_tvtDownloadCounter.fetch_add(1));
+  auto state = std::make_shared<TvtDownloadState>();
+  {
+    std::lock_guard<std::mutex> lock(g_tvtDownloadsMutex);
+    g_tvtDownloads[myHandle] = state;
   }
 
-  void OnOK() override { deferred_.Resolve(Napi::Number::New(Env(), percent_)); }
-  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
-  Napi::Promise GetPromise() { return deferred_.Promise(); }
+  std::thread(RunTvtDownload, lUserID, channel, beginMs, endMs, saveFilePath, state).detach();
 
- private:
-  POINTERHANDLE downloadHandle_;
-  double percent_ = 0;
-  Napi::Promise::Deferred deferred_;
-};
-
-Napi::Value GetBackupProgress(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  const POINTERHANDLE downloadHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
-  auto* worker = new GetBackupProgressWorker(env, downloadHandle);
-  Napi::Promise promise = worker->GetPromise();
-  worker->Queue();
-  return promise;
+  auto deferred = Napi::Promise::Deferred::New(env);
+  deferred.Resolve(Napi::String::New(env, myHandle));
+  return deferred.Promise();
 }
 
-class StopBackupWorker : public Napi::AsyncWorker {
- public:
-  StopBackupWorker(Napi::Env env, POINTERHANDLE downloadHandle)
-      : Napi::AsyncWorker(env), downloadHandle_(downloadHandle), deferred_(Napi::Promise::Deferred::New(env)) {}
+// Plain map lookups now (no native SDK call, no AsyncWorker needed) - the
+// real GetDownloadPos polling already happens inside RunTvtDownload's own
+// loop above; this just reads the atomic it last wrote.
+Napi::Value GetBackupProgress(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  const std::string myHandle = info[0].As<Napi::String>().Utf8Value();
+  std::shared_ptr<TvtDownloadState> state;
+  {
+    std::lock_guard<std::mutex> lock(g_tvtDownloadsMutex);
+    auto it = g_tvtDownloads.find(myHandle);
+    if (it != g_tvtDownloads.end()) state = it->second;
+  }
+  auto deferred = Napi::Promise::Deferred::New(env);
+  const int pct = (!state || state->failed.load()) ? 100 : state->percent.load();
+  deferred.Resolve(Napi::Number::New(env, pct));
+  return deferred.Promise();
+}
 
-  void Execute() override { NET_SDK_StopGetFile(downloadHandle_); }
-
-  void OnOK() override { deferred_.Resolve(Env().Undefined()); }
-  void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
-  Napi::Promise GetPromise() { return deferred_.Promise(); }
-
- private:
-  POINTERHANDLE downloadHandle_;
-  Napi::Promise::Deferred deferred_;
-};
-
+// Signals RunTvtDownload's loop to stop and finalize (NET_SDK_StopGetFile)
+// on its own dedicated thread, rather than calling StopGetFile directly
+// here - see RunTvtDownload's doc comment on why every SDK call for one
+// download stays on that one thread.
 Napi::Value StopBackup(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  const POINTERHANDLE downloadHandle = std::stoll(info[0].As<Napi::String>().Utf8Value());
-  auto* worker = new StopBackupWorker(env, downloadHandle);
-  Napi::Promise promise = worker->GetPromise();
-  worker->Queue();
-  return promise;
+  const std::string myHandle = info[0].As<Napi::String>().Utf8Value();
+  {
+    std::lock_guard<std::mutex> lock(g_tvtDownloadsMutex);
+    auto it = g_tvtDownloads.find(myHandle);
+    if (it != g_tvtDownloads.end()) it->second->stopRequested = true;
+  }
+  auto deferred = Napi::Promise::Deferred::New(env);
+  deferred.Resolve(env.Undefined());
+  return deferred.Promise();
 }
 
 // Device discovery — NET_SDK_DiscoverDevice, a genuine UDP broadcast the

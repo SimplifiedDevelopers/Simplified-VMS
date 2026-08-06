@@ -132,8 +132,19 @@ export function AppShell() {
     // 'controlPanel').
     if (!hasHandledStartupRestore.current) {
       hasHandledStartupRestore.current = true;
-      window.ssmVms.settings.get().then((settings) => {
+      window.ssmVms.settings.get().then(async (settings) => {
         if (!settings.restoreLiveViewOnStart) return;
+        // Only actually worth auto-opening Live View if there's a real
+        // saved grid to restore — previously navigated there
+        // unconditionally whenever the setting was on, even after closing
+        // the app with Live View empty (or never opened at all) that
+        // session, landing on an empty grid instead of staying on Home.
+        // peekLastSessionState is read-only (unlike
+        // consumeStartupRestoreState below it), so checking here doesn't
+        // use up the one real read LiveView's own mount effect still needs
+        // once the tab actually opens.
+        const saved = await window.ssmVms.liveView.peekLastSessionState();
+        if (!saved || saved.tiles.length === 0) return;
         // Deliberately NOT openTab('liveView') — this callback runs after
         // the settings.get() round trip, by which point `loggedIn` in
         // THIS closure is still the stale, pre-update value from the

@@ -1,3 +1,4 @@
+import { statSync } from 'fs';
 import { join } from 'path';
 import { dialog, ipcMain, shell } from 'electron';
 import { getAdapter } from '../adapters/registry';
@@ -13,6 +14,64 @@ function defaultExportFileName(deviceId: string, channel: number, startMs: numbe
   const device = listDevices().find((d) => d.id === deviceId);
   const deviceName = (device?.name ?? deviceId).replace(/[\\/:*?"<>|]/g, '_');
   return `${deviceName}_ch${channel}_${new Date(startMs).toISOString().replace(/[:.]/g, '-')}.mp4`;
+}
+
+// Tracks every native (AsyncWorker-backed, running on a libuv thread) call
+// this file dispatches, so app quit (main/index.ts's before-quit) can wait
+// for all of them to genuinely finish before Node starts tearing down its
+// environment. Confirmed live as a real crash otherwise: quitting while a
+// FindRecordingsWorker was still in flight hit "FATAL ERROR:
+// Error::ThrowAsJavaScriptException napi_throw" inside FindRecordingsWorker
+// ::OnOK - the exact same hard-crash class connectionManager.ts's own
+// inFlight/currentHeartbeatTick tracking exists to prevent for logins
+// (see disconnectAll's doc comment), just never extended to cover the
+// native calls this file issues. Applied uniformly to every adapter call
+// here rather than only the one confirmed to have crashed, since they all
+// share the identical risk shape.
+const pendingCalls = new Set<Promise<unknown>>();
+
+// Set once app quit actually begins (main/index.ts's before-quit) - the
+// renderer's window stays alive and fully able to keep firing new IPC
+// calls for the whole time quit is waiting on pendingCalls below (that's
+// exactly why the wait is a loop, not a single snapshot: a new call
+// dispatched mid-wait needs to be waited on too, not raced past). This
+// flag stops NEW native calls from even starting once shutdown is
+// underway, rather than only ever growing the set to wait for.
+let quitting = false;
+
+export function beginQuitting(): void {
+  quitting = true;
+}
+
+function tracked<T>(promise: Promise<T>): Promise<T> {
+  pendingCalls.add(promise);
+  const clear = (): void => {
+    pendingCalls.delete(promise);
+  };
+  promise.then(clear, clear);
+  return promise;
+}
+
+// A single Promise.allSettled snapshot isn't enough - confirmed live as a
+// real crash: the window is still fully alive during this wait (nothing
+// destroys it until quit actually proceeds), so a new search/command the
+// user (or a still-running effect) triggers mid-wait registers into
+// pendingCalls AFTER a one-shot snapshot would have already been taken,
+// and races right past it into the same fatal napi_throw this exists to
+// prevent. Looping until the set is genuinely empty (combined with
+// `quitting` above blocking brand new calls) closes that gap.
+export async function waitForPendingPlaybackCalls(): Promise<void> {
+  while (pendingCalls.size > 0) {
+    await Promise.allSettled([...pendingCalls]);
+  }
+}
+
+// Called at the top of every handler below that would otherwise dispatch a
+// new native call — checking `quitting` alone (without this) still lets
+// the crash-causing race happen, since tracked() only ever wraps a promise
+// AFTER the underlying native call has already been dispatched.
+function assertNotQuitting(): void {
+  if (quitting) throw new Error('App is closing.');
 }
 
 // Mirrors main/ipc/liveView.ts closely — same "resolve the persistent
@@ -34,6 +93,7 @@ export function registerPlaybackIpcHandlers(): void {
       filters: RecordingSearchFilter[],
       quick?: boolean,
     ): Promise<RecordingSegment[]> => {
+      assertNotQuitting();
       const connection = await ensureConnected(deviceId);
       if (!connection) throw new Error(`Unable to connect to device: ${deviceId}`);
       const adapter = getAdapter(connection.vendor);
@@ -44,9 +104,9 @@ export function registerPlaybackIpcHandlers(): void {
       // device/channel/month within this app session serves instantly
       // from cache, and two requests racing for the same key share one
       // in-flight fetch instead of firing it twice.
-      if (!quick) return adapter.findRecordings(connection.sessionId, channel, startMs, endMs, filters, quick);
+      if (!quick) return tracked(adapter.findRecordings(connection.sessionId, channel, startMs, endMs, filters, quick));
       return recordingCalendarCache.getOrFetch(deviceId, channel, startMs, endMs, filters, () =>
-        adapter.findRecordings!(connection.sessionId, channel, startMs, endMs, filters, quick),
+        tracked(adapter.findRecordings!(connection.sessionId, channel, startMs, endMs, filters, quick)),
       );
     },
   );
@@ -59,11 +119,12 @@ export function registerPlaybackIpcHandlers(): void {
       // this session, not a single fixed window.
       const sender = event.sender;
 
+      assertNotQuitting();
       const connection = await ensureConnected(deviceId);
       if (!connection) throw new Error(`Unable to connect to device: ${deviceId}`);
       const adapter = getAdapter(connection.vendor);
       if (!adapter.startPlayback) throw new Error(`Playback isn't supported for ${connection.vendor} yet`);
-      const viewHandle = await adapter.startPlayback(
+      const viewHandle = await tracked(adapter.startPlayback(
         connection.sessionId,
         channel,
         startMs,
@@ -89,7 +150,7 @@ export function registerPlaybackIpcHandlers(): void {
             }
           }
         },
-      );
+      ));
       return viewHandle;
     },
   );
@@ -97,29 +158,36 @@ export function registerPlaybackIpcHandlers(): void {
   ipcMain.handle(
     'playback:control',
     async (_event, deviceId: string, viewHandle: string, command: PlaybackCommand, value?: number) => {
+      assertNotQuitting();
       const connection = await ensureConnected(deviceId);
       if (!connection) return;
       const adapter = getAdapter(connection.vendor);
       if (!adapter.controlPlayback) throw new Error(`Playback isn't supported for ${connection.vendor} yet`);
-      await adapter.controlPlayback(viewHandle, command, value);
+      await tracked(adapter.controlPlayback(viewHandle, command, value));
     },
   );
 
   ipcMain.handle('playback:getTime', async (_event, deviceId: string, viewHandle: string): Promise<number> => {
+    assertNotQuitting();
     const connection = await ensureConnected(deviceId);
     if (!connection) return 0;
     const adapter = getAdapter(connection.vendor);
     if (!adapter.getPlaybackTime) return 0;
-    return adapter.getPlaybackTime(viewHandle);
+    return tracked(adapter.getPlaybackTime(viewHandle));
   });
 
   ipcMain.handle('playback:stop', async (_event, deviceId: string, viewHandle: string) => {
     clearVideoHealth(viewHandle);
     forgetFrameHandle(viewHandle);
+    // Deliberately NOT assertNotQuitting-guarded — stop is exactly what
+    // should still run (best-effort) even while quitting, tearing down a
+    // still-open session rather than leaving it dangling. disconnectAll's
+    // own logout() calls are separately awaited already; this one just
+    // covers a playback-specific handle.
     const connection = await ensureConnected(deviceId);
     if (!connection) return;
     const adapter = getAdapter(connection.vendor);
-    if (adapter.stopPlayback) await adapter.stopPlayback(viewHandle);
+    if (adapter.stopPlayback) await tracked(adapter.stopPlayback(viewHandle));
   });
 
   // See VmsAdapter.setFrameDelivery's doc comment — pauses/resumes a
@@ -127,9 +195,11 @@ export function registerPlaybackIpcHandlers(): void {
   // a tile that's gone off-screen (hidden behind an expanded tile, or the
   // Playback tab isn't the active one).
   ipcMain.handle('playback:setFrameDelivery', async (_event, deviceId: string, viewHandle: string, enabled: boolean) => {
+    assertNotQuitting();
     const connection = await ensureConnected(deviceId);
     if (!connection) return;
-    await getAdapter(connection.vendor).setFrameDelivery?.(viewHandle, enabled);
+    const promise = getAdapter(connection.vendor).setFrameDelivery?.(viewHandle, enabled);
+    if (promise) await tracked(promise);
   });
 
   // Split into two steps (choose destination, then explicitly start) rather
@@ -184,29 +254,60 @@ export function registerPlaybackIpcHandlers(): void {
       endMs: number,
       filePath: string,
     ): Promise<string> => {
+      assertNotQuitting();
       const connection = await ensureConnected(deviceId);
       if (!connection) throw new Error(`Unable to connect to device: ${deviceId}`);
       const adapter = getAdapter(connection.vendor);
       if (!adapter.startBackup) throw new Error(`Export isn't supported for ${connection.vendor} yet`);
-      return adapter.startBackup(connection.sessionId, channel, startMs, endMs, filePath);
+      // Just the "kick off the download" call itself, not the whole
+      // transfer — progress is polled separately (getBackupProgress) and
+      // downloads intentionally keep running in the background after this
+      // resolves, so tracking this specifically (not the download's full
+      // duration) is what keeps quit from hanging on an in-progress export.
+      return tracked(adapter.startBackup(connection.sessionId, channel, startMs, endMs, filePath));
     },
   );
 
   ipcMain.handle(
     'playback:getBackupProgress',
     async (_event, deviceId: string, downloadHandle: string): Promise<number> => {
+      assertNotQuitting();
       const connection = await ensureConnected(deviceId);
       if (!connection) return 100;
       const adapter = getAdapter(connection.vendor);
       if (!adapter.getBackupProgress) return 100;
-      return adapter.getBackupProgress(downloadHandle);
+      return tracked(adapter.getBackupProgress(downloadHandle));
     },
   );
 
+  // Deliberately NOT assertNotQuitting-guarded — same "stop should still
+  // run during quit" reasoning as playback:stop above, so an in-progress
+  // download's native handle gets torn down cleanly instead of orphaned.
   ipcMain.handle('playback:stopBackup', async (_event, deviceId: string, downloadHandle: string) => {
     const connection = await ensureConnected(deviceId);
     if (!connection) return;
     const adapter = getAdapter(connection.vendor);
-    if (adapter.stopBackup) await adapter.stopBackup(downloadHandle);
+    if (adapter.stopBackup) await tracked(adapter.stopBackup(downloadHandle));
+  });
+
+  // Confirmed live: TVT's getBackupProgress can report "100% done" for a
+  // transfer that actually failed - its native GetDownloadPos legitimately
+  // returns distinct failure signals (a query failure, and a documented
+  // "network anomaly" code), but native/tvt/src/addon.cc's own doc comment
+  // admits both get clamped to 100 rather than surfaced as a real error,
+  // since the SDK gives no other way to tell "genuinely finished" apart
+  // from "failed, and the handle just isn't queryable anymore" - the
+  // result is a "successful" export that's actually a 0-byte file on disk.
+  // Verified here (once, when the renderer's poll first sees 100%) rather
+  // than trusting the progress signal alone - vendor-agnostic since an
+  // empty "successful" export is always wrong regardless of which SDK
+  // produced it.
+  ipcMain.handle('playback:verifyExportedFile', (_event, filePath: string): { ok: boolean; size: number } => {
+    try {
+      const stat = statSync(filePath);
+      return { ok: stat.size > 0, size: stat.size };
+    } catch {
+      return { ok: false, size: 0 };
+    }
   });
 }

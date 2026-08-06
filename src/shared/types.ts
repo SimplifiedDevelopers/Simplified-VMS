@@ -234,6 +234,16 @@ export interface BackupResult {
   count?: number;
 }
 
+// Result of saving a Live View snapshot/recording to the configured
+// Snapshot Path / Local Recording Path (see ipc/liveView.ts) — ok:false
+// with a path-related error means the setting is empty, not a write
+// failure.
+export interface MediaSaveResult {
+  ok: boolean;
+  path?: string;
+  error?: string;
+}
+
 // Result of a login+immediate-logout probe — doesn't persist a session,
 // used only to test connectivity for a device before it's saved (the
 // device doesn't exist in the store yet, so there's nothing to keep

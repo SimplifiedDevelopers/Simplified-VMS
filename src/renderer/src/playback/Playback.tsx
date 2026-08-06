@@ -33,13 +33,6 @@ const TYPE_COLOR: Record<RecordingType, string> = {
   other: theme.textFaint,
 };
 
-const TYPE_LABEL: Record<RecordingType, string> = {
-  continuous: 'Continuous',
-  motion: 'Motion',
-  smart: 'Smart',
-  other: 'Other',
-};
-
 const FILTER_OPTIONS: { value: RecordingSearchFilter; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'continuous', label: 'Continuous' },
@@ -145,6 +138,11 @@ interface DownloadItem {
   path: string;
   progress: number;
   done: boolean;
+  // Set once the file's actually been checked on disk after reaching
+  // 100% — a vendor reporting "done" doesn't necessarily mean the
+  // transfer genuinely succeeded (confirmed live on TVT: a failed
+  // transfer still reports 100%, producing a 0-byte "successful" export).
+  error?: string;
 }
 
 // isActive defaults to true so a popped-out window (PopoutWindow.tsx,
@@ -169,7 +167,15 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // on hover.
   const [hoveredTileIndex, setHoveredTileIndex] = useState<number | null>(null);
 
-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  // toISOString() is always UTC, not local time - once local time passes
+  // whatever hour lines up with UTC midnight (4 PM-ish for US Eastern),
+  // that would default "today" to tomorrow's date instead, silently
+  // searching/exporting a day that hasn't happened yet locally. Confirmed
+  // live as the real cause of an apparently-empty calendar/search.
+  const [date, setDate] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  });
   const [filters, setFilters] = useState<RecordingSearchFilter[]>(['all']);
   const [zoom, setZoom] = useState<(typeof ZOOM_LEVELS)[number]>(1);
 
@@ -202,9 +208,31 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   channelsRef.current = channelsByDevice;
 
   const [clipMark, setClipMark] = useState<ClipMark | null>(null);
+  // Live time-under-cursor while hovering the timeline — replaces the old
+  // native `title` tooltip on each segment (type + start/end), which only
+  // ever appeared after the browser's own hover delay and only over a
+  // filled segment. This follows the mouse continuously across the whole
+  // bar (filled or empty) and shows just the time, not the recording type.
+  const [timelineHoverX, setTimelineHoverX] = useState<number | null>(null);
+  const [timelineHoverMs, setTimelineHoverMs] = useState<number | null>(null);
   const [exportPopup, setExportPopup] = useState<ExportPopupState | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [downloadsPopupOpen, setDownloadsPopupOpen] = useState(false);
+  // Right-side "recording files" panel — a second way to download besides
+  // the Mark Start/Mark End clip markers: lists the selected tile's already
+  // -fetched segments (same data backing the bottom timeline), filterable
+  // by type, each downloadable directly at its own exact start/end instead
+  // of requiring the user to scrub and mark points manually.
+  const [fileListFilter, setFileListFilter] = useState<'all' | 'continuous' | 'motion'>('all');
+
+  // Dismissing (or Cancel-ing) the last remaining download left the popup
+  // open showing just its empty "No downloads." state instead of actually
+  // closing — confirmed live as a real annoyance. Auto-close the instant
+  // the list empties out while it's open, rather than leaving that blank
+  // shell behind.
+  useEffect(() => {
+    if (downloadsPopupOpen && downloads.length === 0) setDownloadsPopupOpen(false);
+  }, [downloads, downloadsPopupOpen]);
   const [statusById, setStatusById] = useState<Record<string, DeviceConnectionStatus | undefined>>({});
 
   const selectedTile = tiles[selectedTileIndex];
@@ -311,6 +339,11 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     return () => clearInterval(interval);
   }, []);
 
+  // Guards stopBackup from firing twice for the same handle - the polling
+  // interval can see pct>=100 again before the async finalize/verify chain
+  // below has set `done: true` in state.
+  const finalizingHandlesRef = useRef<Set<string>>(new Set());
+
   // Polls every download that isn't finished yet — runs independently of
   // whether the export popup is even open, since downloads keep going in
   // the background after it closes.
@@ -321,9 +354,40 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
         if (active.length === 0) return prev;
         active.forEach((d) => {
           window.ssmVms.playback.getBackupProgress(d.deviceId, d.handle).then((pct) => {
-            setDownloads((cur) =>
-              cur.map((item) => (item.handle === d.handle ? { ...item, progress: pct, done: pct >= 100 } : item)),
-            );
+            setDownloads((cur) => cur.map((item) => (item.handle === d.handle ? { ...item, progress: pct } : item)));
+            if (pct < 100) return;
+            if (finalizingHandlesRef.current.has(d.handle)) return;
+            finalizingHandlesRef.current.add(d.handle);
+            // Confirmed against TVT's own SDK demo (BackupDlg.cpp): it
+            // always calls NET_SDK_StopGetFile once the download hits
+            // 100%, even on a normal successful finish, not just on
+            // cancel. Without that finalize call the SDK never actually
+            // flushes/closes the file, so a transfer that legitimately
+            // reports "complete" still leaves a permanent 0-byte file on
+            // disk. stopBackup already wraps that native call — this was
+            // previously only ever invoked from the Cancel button.
+            window.ssmVms.playback
+              .stopBackup(d.deviceId, d.handle)
+              .catch(() => undefined)
+              .finally(() => {
+                // Even with finalize now in place, verify the file itself
+                // before marking this done rather than trusting the
+                // vendor's own progress signal alone (see DownloadItem
+                // .error's doc comment).
+                window.ssmVms.playback.verifyExportedFile(d.path).then(({ ok, size }) => {
+                  setDownloads((cur) =>
+                    cur.map((item) =>
+                      item.handle === d.handle
+                        ? {
+                            ...item,
+                            done: true,
+                            error: ok ? undefined : `Export failed — the saved file is ${size === 0 ? 'empty (0 bytes)' : 'missing'}.`,
+                          }
+                        : item,
+                    ),
+                  );
+                });
+              });
           });
         });
         return prev;
@@ -398,6 +462,16 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // first.
   async function assignChannelToTile(deviceId: string, channel: number): Promise<void> {
     const index = selectedTileIndex;
+    // Diagnostic: reported live that switching devices leaves the calendar
+    // showing the previous device's day dots and the day-view search
+    // finding nothing for the newly picked one — logging the actual
+    // before/after tile state to see whether selectedTileIndex/the
+    // previous tile's deviceId is what's expected at the moment of switch.
+    // eslint-disable-next-line no-console
+    console.log(
+      '[playback-diag] assignChannelToTile index=%d prevDeviceId=%s prevChannel=%s -> newDeviceId=%s newChannel=%s',
+      index, tilesRef.current[index]?.deviceId, tilesRef.current[index]?.channel, deviceId, channel,
+    );
     await stopTile(index);
     const device = devices.find((d) => d.id === deviceId);
     const channelLabel = channelsRef.current[deviceId]?.find((c) => c.channel === channel)?.label ?? `Channel ${channel}`;
@@ -474,6 +548,15 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     const clickedMs = dayStartMs + fraction * DAY_MS;
     const segment = segments.find((s) => clickedMs >= s.startMs && clickedMs <= s.endMs);
     if (segment) playTileFrom(selectedTileIndex, clickedMs, segment.endMs);
+  }
+
+  function handleTimelineHover(e: MouseEvent<HTMLDivElement>): void {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const fraction = Math.min(1, Math.max(0, x / rect.width));
+    const { startMs: dayStartMs } = dayRangeMs();
+    setTimelineHoverX(x);
+    setTimelineHoverMs(dayStartMs + fraction * DAY_MS);
   }
 
   function activeTileIndices(): number[] {
@@ -602,6 +685,34 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     });
   }
 
+  // Right-panel file-list's own download trigger — reuses the exact same
+  // export popup/download flow as the Mark Start/Mark End clip markers,
+  // just pre-filled with this entry's already-known exact start/end instead
+  // of whatever the user happened to scrub to.
+  function handleDownloadSegment(seg: RecordingSegment): void {
+    if (!selectedTile.deviceId || selectedTile.channel === null) return;
+    const deviceId = selectedTile.deviceId;
+    const channel = selectedTile.channel;
+    setExportPopup({
+      deviceId,
+      deviceName: selectedTile.deviceName ?? deviceId,
+      channel,
+      channelLabel: selectedTile.channelLabel ?? `Channel ${channel}`,
+      startMs: seg.startMs,
+      endMs: seg.endMs,
+      path: null,
+      choosing: false,
+    });
+    window.ssmVms.playback.getDefaultExportPath(deviceId, channel, seg.startMs).then((path) => {
+      if (!path) return;
+      setExportPopup((prev) =>
+        prev && prev.deviceId === deviceId && prev.channel === channel && prev.startMs === seg.startMs
+          ? { ...prev, path }
+          : prev,
+      );
+    });
+  }
+
   async function handleChooseExportPath(): Promise<void> {
     if (!exportPopup) return;
     setExportPopup({ ...exportPopup, choosing: true });
@@ -686,6 +797,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   const gridColumns = expandedTileIndex !== null ? 1 : columns;
   const gridRows = expandedTileIndex !== null ? 1 : Math.ceil(layout / columns);
   const { startMs: dayStartMs } = dayRangeMs();
+  const fileListEntries = selectedTile.segments.filter((s) => fileListFilter === 'all' || s.type === fileListFilter);
 
   return (
     <div style={{ height: '100%', display: 'flex' }}>
@@ -698,13 +810,19 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           display: 'flex',
           flexDirection: 'column',
           gap: '0.75rem',
-          overflowY: 'auto',
         }}
       >
-        <div style={{ fontSize: '11px', color: theme.textMuted, marginBottom: '0.2rem' }}>DEVICES</div>
-        <div style={{ marginTop: '-0.5rem' }}>
-          {devices.length === 0 && <div style={{ fontSize: '11.5px', color: theme.textFaint, padding: '0.5rem' }}>No devices yet.</div>}
-          {devices.map((device) => (
+        {/* Only the device tree scrolls — Recording Type, the calendar, and
+            Search below stay put and always visible, regardless of how many
+            devices/channels are expanded above or how short the window is.
+            Previously the whole sidebar was one scrolling column, so a
+            long/expanded device list could push the calendar out of view
+            entirely. */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          <div style={{ fontSize: '11px', color: theme.textMuted, marginBottom: '0.2rem' }}>DEVICES</div>
+          <div style={{ marginTop: '-0.5rem' }}>
+            {devices.length === 0 && <div style={{ fontSize: '11.5px', color: theme.textFaint, padding: '0.5rem' }}>No devices yet.</div>}
+            {devices.map((device) => (
             <div key={device.id} style={{ marginBottom: '0.1rem' }}>
               <div
                 onClick={() => toggleExpandDevice(device.id)}
@@ -751,7 +869,6 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                     <div
                       key={ch.channel}
                       onClick={() => assignChannelToTile(device.id, ch.channel)}
-                      title="Assign to the selected tile and search it"
                       style={{ padding: '0.25rem 0.4rem', borderRadius: '4px', cursor: 'pointer', fontSize: '12px', color: theme.textMuted }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = theme.surface)}
                       onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
@@ -763,9 +880,8 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
               )}
             </div>
           ))}
+          </div>
         </div>
-
-        <div style={{ flex: 1 }} />
 
         <div>
           <div style={{ fontSize: '11px', color: theme.textMuted, marginBottom: '0.4rem', textAlign: 'center' }}>
@@ -862,6 +978,11 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             <div style={{ width: `${zoom * 100}%`, minWidth: '100%' }}>
               <div
                 onClick={handleTimelineClick}
+                onMouseMove={handleTimelineHover}
+                onMouseLeave={() => {
+                  setTimelineHoverX(null);
+                  setTimelineHoverMs(null);
+                }}
                 style={{
                   height: '52px',
                   borderRadius: '3px',
@@ -878,7 +999,6 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                   return (
                     <div
                       key={i}
-                      title={`${TYPE_LABEL[seg.type]}: ${formatTime(seg.startMs)} — ${formatTime(seg.endMs)}`}
                       style={{
                         position: 'absolute',
                         left: `${left}%`,
@@ -891,6 +1011,38 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                     />
                   );
                 })}
+                {timelineHoverX !== null && timelineHoverMs !== null && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: `${timelineHoverX}px`,
+                      top: 0,
+                      bottom: 0,
+                      width: '1px',
+                      background: theme.textFaint,
+                      pointerEvents: 'none',
+                    }}
+                  >
+                    <span
+                      style={{
+                        position: 'absolute',
+                        top: '3px',
+                        left: '50%',
+                        transform: 'translateX(-50%)',
+                        whiteSpace: 'nowrap',
+                        fontSize: '10.5px',
+                        color: theme.text,
+                        background: theme.panel,
+                        border: `1px solid ${theme.border}`,
+                        borderRadius: '3px',
+                        padding: '0.1rem 0.35rem',
+                        pointerEvents: 'none',
+                      }}
+                    >
+                      {formatTime(timelineHoverMs)}
+                    </span>
+                  </div>
+                )}
                 {clipMark && markMatchesSelectedTile && (
                   <div
                     title={`Clip start: ${formatTime(clipMark.startMs)}`}
@@ -916,7 +1068,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                     }}
                   />
                 )}
-                {selectedTile.segments.length === 0 && (
+                {selectedTile.segments.length === 0 && (selectedTile.searching || selectedTile.deviceId) && (
                   <div
                     style={{
                       position: 'absolute',
@@ -928,7 +1080,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                       color: theme.textFaint,
                     }}
                   >
-                    {selectedTile.deviceId ? 'No recordings found for this day' : 'Assign a channel to this tile to search'}
+                    {selectedTile.searching ? 'Searching…' : 'No recordings found for this day'}
                   </div>
                 )}
               </div>
@@ -960,7 +1112,6 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-            <span style={{ fontSize: '11.5px', color: theme.textMuted, marginRight: '0.2rem' }}>Layout</span>
             {LAYOUTS.map((n) => (
               <button
                 key={n}
@@ -1013,38 +1164,50 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             >
               <ScissorsIcon />
             </TransportButton>
-
-            {downloads.length > 0 && (
-              <button
-                onClick={() => setDownloadsPopupOpen(true)}
-                title={`${downloads.filter((d) => !d.done).length} download(s) in progress — click for details`}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.35rem',
-                  padding: '0.3rem 0.5rem',
-                  borderRadius: '4px',
-                  border: `1px solid ${theme.border}`,
-                  background: 'transparent',
-                  cursor: 'pointer',
-                }}
-              >
-                <div style={{ width: '40px', height: '5px', borderRadius: '3px', background: theme.border, overflow: 'hidden' }}>
-                  <div
-                    style={{
-                      width: `${downloads.reduce((sum, d) => sum + d.progress, 0) / downloads.length}%`,
-                      height: '100%',
-                      background: downloads.some((d) => !d.done) ? theme.accent : theme.success,
-                      transition: 'width 0.2s',
-                    }}
-                  />
-                </div>
-                <span style={{ fontSize: '10.5px', color: theme.textMuted }}>{downloads.length}</span>
-              </button>
-            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.6rem' }}>
+            {/* Centered in the gap between the transport controls and the
+                playback time/CPU/Memory readout, rather than tacked onto
+                the end of the tightly-packed transport button group. */}
+            <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+              {downloads.length > 0 &&
+                (() => {
+                  const avgProgress = downloads.reduce((sum, d) => sum + d.progress, 0) / downloads.length;
+                  return (
+                    <button
+                      onClick={() => setDownloadsPopupOpen(true)}
+                      title={`${downloads.filter((d) => !d.done).length} download(s) in progress — click for details`}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        padding: '0.3rem 0.5rem',
+                        borderRadius: '4px',
+                        border: `1px solid ${theme.border}`,
+                        background: 'transparent',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <div style={{ width: '40px', height: '5px', borderRadius: '3px', background: theme.border, overflow: 'hidden' }}>
+                        <div
+                          style={{
+                            width: `${avgProgress}%`,
+                            height: '100%',
+                            background: downloads.some((d) => !d.done)
+                              ? theme.accent
+                              : downloads.some((d) => d.error)
+                                ? theme.danger
+                                : theme.success,
+                            transition: 'width 0.2s',
+                          }}
+                        />
+                      </div>
+                      <span style={{ fontSize: '10.5px', color: theme.textMuted }}>{Math.round(avgProgress)}%</span>
+                    </button>
+                  );
+                })()}
+            </div>
             <span style={{ fontSize: '11.5px', color: theme.textMuted }}>
               {selectedTile.currentMs ? formatTime(selectedTile.currentMs) : '--:--:--'}
             </span>
@@ -1062,6 +1225,97 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
               </strong>
             </span>
           </div>
+        </div>
+      </div>
+
+      {/* Right-side recording-files panel — same width as the left device
+          tree sidebar, additive to (not a replacement for) the bottom
+          timeline + Mark Start/Mark End clip-marker flow above. Lists the
+          selected tile's already-fetched segments so a real recorded range
+          can be downloaded directly, without needing to scrub/mark points
+          manually first. */}
+      <div
+        style={{
+          width: '220px',
+          flexShrink: 0,
+          borderLeft: `1px solid ${theme.border}`,
+          padding: '0.75rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.6rem',
+        }}
+      >
+        <div style={{ fontSize: '11px', color: theme.textMuted }}>RECORDING FILES</div>
+        <div style={{ display: 'flex', gap: '0.35rem' }}>
+          {(['all', 'continuous', 'motion'] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setFileListFilter(t)}
+              style={{
+                flex: 1,
+                padding: '0.3rem 0',
+                borderRadius: '4px',
+                border: `1px solid ${t === fileListFilter ? theme.accent : theme.border}`,
+                background: t === fileListFilter ? theme.accentFaint : 'transparent',
+                color: t === fileListFilter ? theme.accentHover : theme.textMuted,
+                fontSize: '11px',
+                cursor: 'pointer',
+              }}
+            >
+              {t === 'all' ? 'All' : t === 'continuous' ? 'Continuous' : 'Motion'}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+          {!selectedTile.deviceId && (
+            <div style={{ fontSize: '11.5px', color: theme.textFaint, padding: '0.5rem' }}>
+              No channel selected for this tile.
+            </div>
+          )}
+          {selectedTile.deviceId && fileListEntries.length === 0 && (
+            <div style={{ fontSize: '11.5px', color: theme.textFaint, padding: '0.5rem' }}>
+              {selectedTile.searching ? 'Searching…' : 'No recordings found for this day'}
+            </div>
+          )}
+          {fileListEntries.map((seg, i) => (
+            <div
+              key={i}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '0.4rem',
+                padding: '0.4rem 0.5rem',
+                borderRadius: '4px',
+                border: `1px solid ${theme.border}`,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', overflow: 'hidden' }}>
+                <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: TYPE_COLOR[seg.type], flexShrink: 0 }} />
+                <span style={{ fontSize: '11px', color: theme.text, whiteSpace: 'nowrap' }}>
+                  {formatTime(seg.startMs)} – {formatTime(seg.endMs)}
+                </span>
+              </div>
+              <button
+                onClick={() => handleDownloadSegment(seg)}
+                title="Download this recording"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: theme.textMuted,
+                  cursor: 'pointer',
+                  padding: '0.15rem',
+                  display: 'flex',
+                  flexShrink: 0,
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = theme.accentHover)}
+                onMouseLeave={(e) => (e.currentTarget.style.color = theme.textMuted)}
+              >
+                <DownloadIcon />
+              </button>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -1097,8 +1351,24 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
       {downloadsPopupOpen && (
         <Modal width={420} onDismiss={() => setDownloadsPopupOpen(false)}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '1rem 1.25rem',
+              borderBottom: `1px solid ${theme.border}`,
+            }}
+          >
+            <span style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Downloads</span>
+            <button
+              onClick={() => setDownloadsPopupOpen(false)}
+              style={{ background: 'none', border: 'none', color: theme.textMuted, fontSize: '16px', cursor: 'pointer' }}
+            >
+              &times;
+            </button>
+          </div>
           <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-            <div style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Downloads</div>
             {downloads.length === 0 && (
               <div style={{ fontSize: '12px', color: theme.textFaint }}>No downloads.</div>
             )}
@@ -1124,7 +1394,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                       style={{
                         width: `${d.progress}%`,
                         height: '100%',
-                        background: d.done ? theme.success : theme.accent,
+                        background: d.error ? theme.danger : d.done ? theme.success : theme.accent,
                         transition: 'width 0.2s',
                       }}
                     />
@@ -1133,6 +1403,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                     {Math.round(d.progress)}%
                   </span>
                 </div>
+                {d.error && <div style={{ fontSize: '11px', color: theme.danger }}>{d.error}</div>}
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   <button onClick={() => handleOpenDownloadLocation(d.path)} style={secondaryButtonStyle}>
                     Open
@@ -1220,13 +1491,6 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                   <CameraOffIcon size={36} />
                   <span style={{ fontSize: '11px', fontWeight: 600 }}>No Signal</span>
                 </div>
-              </Centered>
-            )}
-            {!tile.viewHandle && !tile.error && (
-              <Centered>
-                <span style={{ color: theme.textFaint, fontSize: '11px' }}>
-                  {tile.searching ? 'Searching…' : 'Click a recording below to play'}
-                </span>
               </Centered>
             )}
             {tile.error && (
@@ -1382,6 +1646,17 @@ function ScissorsIcon() {
       <line x1="20" y1="4" x2="8.12" y2="15.88" />
       <line x1="14.47" y1="14.48" x2="20" y2="20" />
       <line x1="8.12" y1="8.12" x2="12" y2="12" />
+    </svg>
+  );
+}
+
+// Right-panel file-list entries' per-item download button.
+function DownloadIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3v12" />
+      <path d="M7 10l5 5 5-5" />
+      <path d="M5 21h14" />
     </svg>
   );
 }

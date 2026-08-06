@@ -10,13 +10,16 @@ import type {
   SystemStats,
 } from '../../../shared/types';
 import { VideoCanvas } from './VideoCanvas';
+import { DigitalZoomLayer } from './DigitalZoom';
 import { SaveLayoutDialog } from './SaveLayoutDialog';
+import { RenameChannelDialog } from './RenameChannelDialog';
 import { TileContextMenu } from './TileContextMenu';
+import { ChannelContextMenu } from './ChannelContextMenu';
 import { LayoutPickerPopup } from './LayoutPickerPopup';
 import { LAYOUTS, getLayoutShape } from './layoutDefs';
 import emptyTileCamera from '../assets/empty-tile-camera.png';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { CameraOffIcon } from '../components/icons';
+import { CameraIcon, CameraOffIcon, RecordIcon, RestoreIcon, StopIcon } from '../components/icons';
 
 interface TileState {
   deviceId: string;
@@ -79,6 +82,12 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   const [channelErrors, setChannelErrors] = useState<Record<string, string | null>>({});
   const tilesRef = useRef(tiles);
   tilesRef.current = tiles;
+  // Read by the unmount-cleanup effect below, which needs the CURRENT
+  // layout at whatever moment the tab actually gets closed — an effect
+  // with an empty deps array only ever sees the value from its own first
+  // render otherwise (a stale closure), not this component's latest one.
+  const layoutRef = useRef(layout);
+  layoutRef.current = layout;
   const channelsRef = useRef(channelsByDevice);
   channelsRef.current = channelsByDevice;
   const gridOperationTokenRef = useRef(0);
@@ -129,6 +138,12 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   // occupying the corner of every playing tile.
   const [hoveredTileIndex, setHoveredTileIndex] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ tileIndex: number; x: number; y: number } | null>(null);
+  // Right-click menu on a single channel in the sidebar's device tree
+  // (distinct from `contextMenu` above, which is a grid tile's own menu).
+  const [channelContextMenu, setChannelContextMenu] = useState<{ deviceId: string; channel: number; x: number; y: number } | null>(
+    null,
+  );
+  const [renamingChannel, setRenamingChannel] = useState<{ deviceId: string; channel: number; currentLabel: string } | null>(null);
   const [layoutPickerOpen, setLayoutPickerOpen] = useState(false);
   const [devicesCollapsed, setDevicesCollapsed] = useState(false);
   const [customLayoutsCollapsed, setCustomLayoutsCollapsed] = useState(false);
@@ -142,6 +157,186 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   // what Live View renders and asks the main process to toggle the
   // window's real fullscreen state.
   const [gridFullscreen, setGridFullscreen] = useState(false);
+
+  // With only one tile actually on screen — either a genuine 1-camera grid
+  // or any layout with a tile double-click-expanded to fill it — that tile
+  // IS "the" channel for Snapshot/Record and the selection outline, whether
+  // or not it was ever explicitly clicked. Without this, both stayed
+  // disabled after switching to single-view until the tile was clicked
+  // once first, confirmed as a real annoyance live.
+  function getEffectiveSelectedTileIndex(): number | null {
+    if (expandedTileIndex !== null) return expandedTileIndex;
+    if (layout === 1) return 0;
+    return selectedTileIndex;
+  }
+
+  // Whatever was playing right before the last Close All — lets the
+  // Restore button bring it back in one click. In-memory/session-only
+  // (unlike lastLiveViewStateStore's on-disk "Start App" restore, which
+  // survives an app relaunch); this is just an undo for one specific
+  // action, not a general session snapshot.
+  const [lastClosedSnapshot, setLastClosedSnapshot] = useState<{
+    layout: (typeof LAYOUTS)[number];
+    tiles: { tileIndex: number; deviceId: string; channel: number; streamType: StreamType }[];
+  } | null>(null);
+
+  // Keyed by viewHandle (not tile index, same convention as
+  // videoHealthByHandle) — Snapshot/Record grab the selected tile's own
+  // live <canvas> straight off this map rather than keeping a second,
+  // separate decode/render path in sync with what's already on screen.
+  const canvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  // Which viewHandle is currently being recorded, if any — recording is
+  // one-at-a-time across the whole grid (a single toolbar button, not a
+  // per-tile control), and deliberately keeps recording whatever was
+  // selected when Record was clicked even if the selection changes
+  // afterward; only closing/reassigning that specific tile stops it (see
+  // the auto-stop effect below).
+  const [recordingHandle, setRecordingHandle] = useState<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingMetaRef = useRef<{ deviceName: string; channel: number } | null>(null);
+  // Brief inline status text next to the Snapshot/Record toolbar icons
+  // ("Snapshot saved", "Set a path in Settings first", etc.) — self-clears
+  // after a few seconds rather than needing a dismiss action for what's
+  // always a short, disposable confirmation. `path` is only set on a
+  // successful save, making the message clickable to reveal the file in
+  // Explorer (reuses playback's existing openExportLocation — plain
+  // shell.showItemInFolder under the hood, nothing playback-specific
+  // about it).
+  const [actionMessage, setActionMessage] = useState<{ text: string; path?: string } | null>(null);
+  const actionMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function showActionMessage(text: string, path?: string): void {
+    setActionMessage({ text, path });
+    if (actionMessageTimerRef.current) clearTimeout(actionMessageTimerRef.current);
+    actionMessageTimerRef.current = setTimeout(() => setActionMessage(null), 10000);
+  }
+
+  function stopRecording(): void {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    setRecordingHandle(null);
+  }
+
+  // If the tile being recorded gets closed, reassigned, or swapped away
+  // mid-recording, its viewHandle disappears from `tiles` — stop (and
+  // save whatever was captured so far) instead of recording a now-
+  // orphaned MediaStream indefinitely.
+  useEffect(() => {
+    if (!recordingHandle) return;
+    const stillPresent = Object.values(tiles).some((t) => t.viewHandle === recordingHandle);
+    if (!stillPresent) stopRecording();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tiles, recordingHandle]);
+
+  // Which tile (if any) has Digital Zoom's interactive mode on — mouse
+  // wheel/click-drag on that specific tile zoom/pan it (see
+  // DigitalZoom.tsx); every other tile behaves normally. One at a time,
+  // same convention as recording. The actual scale/pan lives inside
+  // DigitalZoomLayer itself (keyed by viewHandle there), not here — this
+  // is just "which tile is currently listening for zoom gestures."
+  const [zoomTileIndex, setZoomTileIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (zoomTileIndex === null) return;
+    if (!tiles[zoomTileIndex]?.viewHandle) setZoomTileIndex(null);
+  }, [tiles, zoomTileIndex]);
+
+  // Core snapshot capture for a single tile, shared by the toolbar's
+  // Snapshot button (effective-selected tile), the tile context menu's own
+  // Snapshot item (whichever tile was right-clicked, not necessarily
+  // selected — same "acts on that specific tile" convention as Close), and
+  // Snapshot All (every playing tile at once).
+  async function snapshotTile(tileIndex: number): Promise<{ ok: boolean; path?: string; error?: string }> {
+    const tile = tilesRef.current[tileIndex];
+    if (!tile?.viewHandle) return { ok: false, error: 'Not playing.' };
+    const canvas = canvasesRef.current.get(tile.viewHandle);
+    if (!canvas) return { ok: false, error: 'No frame to capture yet.' };
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) return { ok: false, error: 'No frame to capture yet.' };
+    const buffer = await blob.arrayBuffer();
+    return window.ssmVms.liveView.saveSnapshot(tile.deviceName, tile.channel, buffer);
+  }
+
+  async function takeSnapshot(tileIndex?: number): Promise<void> {
+    const idx = tileIndex ?? getEffectiveSelectedTileIndex();
+    if (idx === null || idx === undefined) return;
+    const result = await snapshotTile(idx);
+    if (result.ok) showActionMessage(`Snapshot saved to ${result.path}`, result.path);
+    else showActionMessage(`Snapshot failed: ${result.error ?? 'unknown error'}`);
+  }
+
+  async function snapshotAllTiles(): Promise<void> {
+    const filledIndices = Object.keys(tilesRef.current)
+      .map(Number)
+      .filter((i) => tilesRef.current[i]?.viewHandle);
+    if (filledIndices.length === 0) {
+      showActionMessage('No channels playing.');
+      return;
+    }
+    const results = await Promise.all(filledIndices.map((i) => snapshotTile(i)));
+    const succeeded = results.filter((r) => r.ok).length;
+    showActionMessage(
+      succeeded === results.length
+        ? `Snapshot All: saved ${succeeded} channel${succeeded === 1 ? '' : 's'}.`
+        : `Snapshot All: saved ${succeeded} of ${results.length} channel${results.length === 1 ? '' : 's'}.`,
+    );
+  }
+
+  function startRecording(tileIndex?: number): void {
+    const idx = tileIndex ?? getEffectiveSelectedTileIndex();
+    if (idx === null || idx === undefined) return;
+    const tile = tiles[idx];
+    if (!tile?.viewHandle) return;
+    const canvas = canvasesRef.current.get(tile.viewHandle);
+    if (!canvas) return;
+
+    const stream = canvas.captureStream(15);
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : undefined;
+    let recorder: MediaRecorder;
+    try {
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    } catch {
+      showActionMessage('Recording failed to start.');
+      return;
+    }
+
+    recordedChunksRef.current = [];
+    recordingMetaRef.current = { deviceName: tile.deviceName, channel: tile.channel };
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+    };
+    recorder.onstop = async () => {
+      const meta = recordingMetaRef.current;
+      const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+      recordedChunksRef.current = [];
+      if (!meta || blob.size === 0) return;
+      const buffer = await blob.arrayBuffer();
+      const result = await window.ssmVms.liveView.saveRecording(meta.deviceName, meta.channel, buffer);
+      if (result.ok) showActionMessage(`Recording saved to ${result.path}`, result.path);
+      else showActionMessage(`Recording failed: ${result.error ?? 'unknown error'}`);
+    };
+    recorder.start(1000);
+    mediaRecorderRef.current = recorder;
+    setRecordingHandle(tile.viewHandle);
+  }
+
+  function toggleRecording(): void {
+    if (recordingHandle) stopRecording();
+    else startRecording();
+  }
+
+  // Context menu's own "Start/Stop Local Recording" item — targets
+  // whichever tile was right-clicked specifically, same as toggleRecording
+  // above but scoped to one tile instead of the toolbar's effective
+  // selection. If that tile is the one currently recording, this stops it;
+  // otherwise it starts a new recording there (implicitly replacing any
+  // other in-progress recording, since only one runs at a time).
+  function toggleRecordingForTile(tileIndex: number): void {
+    const tile = tiles[tileIndex];
+    if (tile?.viewHandle && tile.viewHandle === recordingHandle) stopRecording();
+    else startRecording(tileIndex);
+  }
 
   async function toggleGridFullscreen(): Promise<void> {
     const next = !gridFullscreen;
@@ -244,6 +439,16 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
       Object.values(tilesRef.current).forEach((tile) => {
         if (tile.viewHandle) window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle);
       });
+      // Closing the Live View tab (as opposed to just switching away from
+      // it, which keeps this component mounted-but-hidden - see AppShell's
+      // "every opened tab stays mounted" comment) is exactly when the
+      // debounced save effect above can't be trusted: its own cleanup
+      // cancels whatever save was pending the instant this component
+      // unmounts, so the very last, most important update - "it's now
+      // empty" - silently never reaches disk, leaving Start App to restore
+      // a grid the user explicitly closed. Written immediately here
+      // instead of relying on that debounce.
+      window.ssmVms.liveView.saveLastSessionState({ layout: layoutRef.current, tiles: [] });
     };
   }, []);
 
@@ -317,6 +522,15 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     } finally {
       setLoadingChannelsFor(null);
     }
+  }
+
+  // Sidebar channel context menu's Rename — local-only override (see
+  // deviceStore.ts's renameDeviceChannel), so this just needs to refresh
+  // channelsByDevice with whatever the main process persisted, not touch
+  // any live session (the channel might not even be playing anywhere).
+  async function renameChannel(deviceId: string, channel: number, label: string): Promise<void> {
+    const updated = await window.ssmVms.devices.renameChannel(deviceId, channel, label);
+    if (updated) setChannelsByDevice((prev) => ({ ...prev, [deviceId]: updated }));
   }
 
   async function toggleExpand(deviceId: string): Promise<void> {
@@ -425,8 +639,11 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
 
   // A selected tile (single-clicked in the grid) takes priority as the
   // target — otherwise falls back to the first empty tile, same as before.
-  function assignToSelectedOrFirstEmptyTile(deviceId: string, channel: number): void {
-    const streamType: StreamType = layout === 1 ? 'main' : 'sub';
+  // streamTypeOverride is set by the sidebar channel's own context menu
+  // ("Main Stream"/"Sub Stream") to force a specific stream regardless of
+  // the layout-based default below; plain click/drag leaves it unset.
+  function assignToSelectedOrFirstEmptyTile(deviceId: string, channel: number, streamTypeOverride?: StreamType): void {
+    const streamType: StreamType = streamTypeOverride ?? (layout === 1 ? 'main' : 'sub');
     if (selectedTileIndex !== null && selectedTileIndex < layout) {
       assign(selectedTileIndex, deviceId, channel, streamType);
       return;
@@ -674,6 +891,17 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     for (let i = 0; i < layout; i++) {
       tileGenerationRef.current[i] = (tileGenerationRef.current[i] ?? 0) + 1;
     }
+
+    const closedTiles = Object.entries(tilesRef.current).map(([tileIndex, tile]) => ({
+      tileIndex: Number(tileIndex),
+      deviceId: tile.deviceId,
+      channel: tile.channel,
+      streamType: tile.streamType,
+    }));
+    if (closedTiles.length > 0) {
+      setLastClosedSnapshot({ layout, tiles: closedTiles });
+    }
+
     await Promise.all(
       Object.values(tilesRef.current).map((tile) =>
         tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
@@ -682,6 +910,17 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     setTiles({});
     setSelectedTileIndex(null);
     setExpandedTileIndex(null);
+  }
+
+  // Restore button next to Close All — replays exactly what closeAllTiles
+  // just captured above. Same staggered-load mechanism "Start App" already
+  // uses to restore across an app relaunch (playAssignmentsStaggered),
+  // just fed from the in-memory snapshot instead of disk.
+  function restoreLastClosed(): void {
+    if (!lastClosedSnapshot) return;
+    const token = ++gridOperationTokenRef.current;
+    setLayout(lastClosedSnapshot.layout);
+    playAssignmentsStaggered(lastClosedSnapshot.tiles, token);
   }
 
   function handleTileDrop(tileIndex: number, e: React.DragEvent): void {
@@ -738,13 +977,15 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   const layoutShape = getLayoutShape(layout);
   const columns = layoutShape.columns;
   const rows = layoutShape.rows;
+  const effectiveSelectedTileIndex = getEffectiveSelectedTileIndex();
+  const selectedTile = effectiveSelectedTileIndex !== null ? tiles[effectiveSelectedTileIndex] : undefined;
   const displayIndices = expandedTileIndex !== null ? [expandedTileIndex] : Array.from({ length: layout }, (_, i) => i);
   const gridColumns = expandedTileIndex !== null ? 1 : columns;
   const gridRows = expandedTileIndex !== null ? 1 : rows;
 
   function renderTile(i: number) {
     const tile = tiles[i];
-    const isSelected = selectedTileIndex === i;
+    const isSelected = effectiveSelectedTileIndex === i;
     const isExpanded = expandedTileIndex === i;
     const isHovered = hoveredTileIndex === i;
     // Only apply a mixed layout's explicit cell/span when the whole grid
@@ -758,8 +999,10 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
         key={i}
         // Only a filled tile can be the drag SOURCE (nothing to swap out of
         // an empty one) - it can still be a drop TARGET either way, handled
-        // by handleTileDrop/swapTiles above.
-        draggable={Boolean(tile)}
+        // by handleTileDrop/swapTiles above. Disabled while this tile is
+        // the active Digital Zoom target - a drag gesture there means
+        // "rubber-band select a zoom region", not "swap tiles".
+        draggable={Boolean(tile) && zoomTileIndex !== i}
         onDragStart={(e) => {
           if (!tile) return;
           e.dataTransfer.setData('application/json', JSON.stringify({ type: 'tile', tileIndex: i }));
@@ -767,7 +1010,14 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => handleTileDrop(i, e)}
         onClick={() => setSelectedTileIndex((prev) => (prev === i ? null : i))}
-        onDoubleClick={() => toggleExpandTile(i)}
+        onDoubleClick={() => {
+          // Double-click already collapses/expands the single-channel
+          // view, which is usually exactly when Digital Zoom gets used —
+          // exit zoom at the same time instead of leaving it zoomed in
+          // once back in the full grid.
+          if (zoomTileIndex === i) setZoomTileIndex(null);
+          toggleExpandTile(i);
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           setContextMenu({ tileIndex: i, x: e.clientX, y: e.clientY });
@@ -811,7 +1061,19 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
 
         {tile && (
           <>
-            {tile.viewHandle && <VideoCanvas viewHandle={tile.viewHandle} />}
+            {tile.viewHandle && (
+              <DigitalZoomLayer key={tile.viewHandle} active={zoomTileIndex === i}>
+                <VideoCanvas
+                  viewHandle={tile.viewHandle}
+                  onCanvasRef={(el) => {
+                    const handle = tile.viewHandle;
+                    if (!handle) return;
+                    if (el) canvasesRef.current.set(handle, el);
+                    else canvasesRef.current.delete(handle);
+                  }}
+                />
+              </DigitalZoomLayer>
+            )}
             {tile.viewHandle && videoHealthByHandle[tile.viewHandle] === false && (
               <Centered>
                 <div
@@ -850,7 +1112,13 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
                 color: '#fff',
               }}
             >
-              <span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                {tile.viewHandle && tile.viewHandle === recordingHandle && (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', color: theme.danger, fontWeight: 700 }}>
+                    <RecordIcon size={9} />
+                    REC
+                  </span>
+                )}
                 {tile.deviceName} · ch{tile.channel}
                 {isExpanded && (
                   <span style={{ color: 'rgba(255,255,255,0.6)', marginLeft: '0.4rem' }}>
@@ -906,6 +1174,35 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     </div>
   );
 
+  // Shared with the fullscreen branch below - a tile's right-click menu
+  // (including Snapshot/Record and the Full Screen toggle itself) needs to
+  // keep working once already in fullscreen, not just from the normal
+  // toolbar+sidebar layout.
+  const contextMenuElement = contextMenu && (
+    <TileContextMenu
+      x={contextMenu.x}
+      y={contextMenu.y}
+      hasContent={Boolean(tiles[contextMenu.tileIndex])}
+      isGridFullscreen={gridFullscreen}
+      isRecordingThisTile={Boolean(recordingHandle) && tiles[contextMenu.tileIndex]?.viewHandle === recordingHandle}
+      isZoomedTile={zoomTileIndex === contextMenu.tileIndex}
+      currentStream={tiles[contextMenu.tileIndex]?.streamType}
+      anyTilesFilled={Object.keys(tiles).length > 0}
+      onDismiss={() => setContextMenu(null)}
+      onClose={() => clearTile(contextMenu.tileIndex)}
+      onCloseAll={() => closeAllTiles()}
+      onFullScreen={() => toggleGridFullscreen()}
+      onSelectStream={(streamType) => {
+        const tile = tiles[contextMenu.tileIndex];
+        if (tile) assign(contextMenu.tileIndex, tile.deviceId, tile.channel, streamType);
+      }}
+      onSnapshot={() => takeSnapshot(contextMenu.tileIndex)}
+      onSnapshotAll={() => snapshotAllTiles()}
+      onToggleRecording={() => toggleRecordingForTile(contextMenu.tileIndex)}
+      onToggleZoom={() => setZoomTileIndex((prev) => (prev === contextMenu.tileIndex ? null : contextMenu.tileIndex))}
+    />
+  );
+
   // Real OS-level fullscreen, showing nothing but the grid itself — no
   // sidebar, no toolbar, no tab bar (this covers the whole viewport,
   // including AppShell's tabs, even though AppShell stays mounted
@@ -915,6 +1212,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     return (
       <div style={{ position: 'fixed', inset: 0, zIndex: 2000, background: theme.bg, display: 'flex' }}>
         {gridElement}
+        {contextMenuElement}
         <button
           onClick={toggleGridFullscreen}
           title="Exit fullscreen (Esc)"
@@ -1039,6 +1337,10 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
                       )
                     }
                     onClick={() => assignToSelectedOrFirstEmptyTile(device.id, ch.channel)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setChannelContextMenu({ deviceId: device.id, channel: ch.channel, x: e.clientX, y: e.clientY });
+                    }}
                     title="Click to play in the selected tile (or the next open one) · drag onto a tile to place it there"
                     style={{
                       padding: '0.3rem 0.5rem',
@@ -1169,12 +1471,60 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
           >
             &#10005;
           </ToolbarIconButton>
-          <ToolbarIconButton title="Audio — coming soon" disabled>
-            &#128266;
+          <ToolbarIconButton
+            title={
+              Object.keys(tiles).length > 0
+                ? 'Close all channels first'
+                : lastClosedSnapshot
+                  ? 'Restore all channels'
+                  : 'Nothing to restore yet'
+            }
+            disabled={Object.keys(tiles).length > 0 || !lastClosedSnapshot}
+            onClick={restoreLastClosed}
+          >
+            <RestoreIcon />
           </ToolbarIconButton>
-          <ToolbarIconButton title="Snapshot — coming soon" disabled>
-            &#128247;
+          <ToolbarIconButton
+            title={selectedTile?.viewHandle ? 'Take Snapshot' : 'Select a playing channel first'}
+            disabled={!selectedTile?.viewHandle}
+            onClick={() => takeSnapshot()}
+          >
+            <CameraIcon />
           </ToolbarIconButton>
+          <ToolbarIconButton
+            title={
+              recordingHandle
+                ? 'Stop Recording'
+                : selectedTile?.viewHandle
+                  ? 'Start Recording'
+                  : 'Select a playing channel first'
+            }
+            disabled={!recordingHandle && !selectedTile?.viewHandle}
+            danger={Boolean(recordingHandle)}
+            onClick={toggleRecording}
+          >
+            {recordingHandle ? <StopIcon /> : <RecordIcon />}
+          </ToolbarIconButton>
+
+          {actionMessage && (
+            <span
+              title={actionMessage.path ? 'Click to open file location' : undefined}
+              onClick={actionMessage.path ? () => window.ssmVms.playback.openExportLocation(actionMessage.path!) : undefined}
+              style={{
+                fontSize: '11px',
+                color: actionMessage.path ? theme.accentHover : theme.textMuted,
+                marginLeft: '0.3rem',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                maxWidth: '320px',
+                cursor: actionMessage.path ? 'pointer' : 'default',
+                textDecoration: actionMessage.path ? 'underline' : 'none',
+              }}
+            >
+              {actionMessage.text}
+            </span>
+          )}
 
           <div style={{ flex: 1 }} />
 
@@ -1214,21 +1564,29 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
         />
       )}
 
-      {contextMenu && (
-        <TileContextMenu
-          x={contextMenu.x}
-          y={contextMenu.y}
-          hasContent={Boolean(tiles[contextMenu.tileIndex])}
-          isExpanded={expandedTileIndex === contextMenu.tileIndex}
-          currentStream={tiles[contextMenu.tileIndex]?.streamType}
-          anyTilesFilled={Object.keys(tiles).length > 0}
-          onDismiss={() => setContextMenu(null)}
-          onClose={() => clearTile(contextMenu.tileIndex)}
-          onCloseAll={() => closeAllTiles()}
-          onFullScreen={() => toggleExpandTile(contextMenu.tileIndex)}
-          onSelectStream={(streamType) => {
-            const tile = tiles[contextMenu.tileIndex];
-            if (tile) assign(contextMenu.tileIndex, tile.deviceId, tile.channel, streamType);
+      {contextMenuElement}
+
+      {channelContextMenu && (
+        <ChannelContextMenu
+          x={channelContextMenu.x}
+          y={channelContextMenu.y}
+          onDismiss={() => setChannelContextMenu(null)}
+          onRename={() => {
+            const label = channelsByDevice[channelContextMenu.deviceId]?.find((c) => c.channel === channelContextMenu.channel)?.label ?? '';
+            setRenamingChannel({ deviceId: channelContextMenu.deviceId, channel: channelContextMenu.channel, currentLabel: label });
+          }}
+          onMainStream={() => assignToSelectedOrFirstEmptyTile(channelContextMenu.deviceId, channelContextMenu.channel, 'main')}
+          onSubStream={() => assignToSelectedOrFirstEmptyTile(channelContextMenu.deviceId, channelContextMenu.channel, 'sub')}
+        />
+      )}
+
+      {renamingChannel && (
+        <RenameChannelDialog
+          currentLabel={renamingChannel.currentLabel}
+          onCancel={() => setRenamingChannel(null)}
+          onSave={async (label) => {
+            await renameChannel(renamingChannel.deviceId, renamingChannel.channel, label);
+            setRenamingChannel(null);
           }}
         />
       )}

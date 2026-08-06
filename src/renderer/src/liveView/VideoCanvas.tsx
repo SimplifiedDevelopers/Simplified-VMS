@@ -8,10 +8,17 @@ interface Props {
   // frames on separate IPC channels but share this exact same
   // decode-to-canvas paint logic.
   subscribe?: (viewHandle: string, callback: (frame: DecodedFrame) => void) => () => void;
+  // Hands the live <canvas> element back up to the caller (keyed by
+  // viewHandle in LiveView's own ref map) so Snapshot/Record can grab
+  // exactly what's on screen via canvas.toBlob()/captureStream() —
+  // reusing the already-painted canvas means snapshots/recordings are
+  // guaranteed to match what the tech actually sees, with no separate
+  // decode path to keep in sync.
+  onCanvasRef?: (canvas: HTMLCanvasElement | null) => void;
 }
 
-export function VideoCanvas({ viewHandle, subscribe = window.ssmVms.liveView.onFrame }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+export function VideoCanvas({ viewHandle, subscribe = window.ssmVms.liveView.onFrame, onCanvasRef }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Reused across frames instead of allocating a new Uint8ClampedArray +
   // ImageData every single frame — confirmed live on real (older, weaker)
   // hardware: for a full main-stream feed (much higher resolution than the
@@ -47,5 +54,13 @@ export function VideoCanvas({ viewHandle, subscribe = window.ssmVms.liveView.onF
     return unsubscribe;
   }, [viewHandle, subscribe]);
 
-  return <canvas ref={canvasRef} style={{ width: '100%', height: '100%', background: '#000', display: 'block' }} />;
+  return (
+    <canvas
+      ref={(el) => {
+        canvasRef.current = el;
+        onCanvasRef?.(el);
+      }}
+      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
+    />
+  );
 }

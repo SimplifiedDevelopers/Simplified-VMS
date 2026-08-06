@@ -6,7 +6,20 @@ interface Props {
   x: number;
   y: number;
   hasContent: boolean;
-  isExpanded: boolean;
+  // Real OS-level borderless fullscreen (same state as the bottom-right
+  // toolbar icon) - NOT the single-tile "expand to fill the grid" state,
+  // which this menu item used to trigger before. Drives the "Full
+  // Screen"/"Exit Full Screen" label swap.
+  isGridFullscreen: boolean;
+  // Whether THIS tile (the one right-clicked, not necessarily the
+  // toolbar's selected tile) is the one currently recording — drives the
+  // "Start"/"Stop Local Recording" label swap the same way.
+  isRecordingThisTile: boolean;
+  // Whether THIS tile is the one currently listening for Digital Zoom's
+  // wheel/drag gestures — drives the "Digital Zoom"/"Exit Digital Zoom"
+  // label swap the same way Full Screen does (no checkmark, matching that
+  // same precedent).
+  isZoomedTile: boolean;
   currentStream: StreamType | undefined;
   anyTilesFilled: boolean;
   onDismiss: () => void;
@@ -14,6 +27,10 @@ interface Props {
   onCloseAll: () => void;
   onFullScreen: () => void;
   onSelectStream: (streamType: StreamType) => void;
+  onSnapshot: () => void;
+  onSnapshotAll: () => void;
+  onToggleRecording: () => void;
+  onToggleZoom: () => void;
 }
 
 // Rough menu footprint used to keep it fully on-screen — doesn't need to be
@@ -26,7 +43,9 @@ export function TileContextMenu({
   x,
   y,
   hasContent,
-  isExpanded,
+  isGridFullscreen,
+  isRecordingThisTile,
+  isZoomedTile,
   currentStream,
   anyTilesFilled,
   onDismiss,
@@ -34,6 +53,10 @@ export function TileContextMenu({
   onCloseAll,
   onFullScreen,
   onSelectStream,
+  onSnapshot,
+  onSnapshotAll,
+  onToggleRecording,
+  onToggleZoom,
 }: Props) {
   const [streamSubmenuOpen, setStreamSubmenuOpen] = useState(false);
   const left = Math.min(x, window.innerWidth - MENU_WIDTH - 8);
@@ -74,11 +97,20 @@ export function TileContextMenu({
         <MenuItem label="Close" disabled={!hasContent} onClick={() => runAndDismiss(onClose)} />
         <MenuItem label="Close All" disabled={!anyTilesFilled} onClick={() => runAndDismiss(onCloseAll)} />
         <MenuItem
-          label={isExpanded ? 'Exit Full Screen' : 'Full Screen'}
-          disabled={!hasContent}
+          label={isGridFullscreen ? 'Exit Full Screen' : 'Full Screen'}
           onClick={() => runAndDismiss(onFullScreen)}
         />
-        <MenuItem label="Digital Zoom" disabled title="Coming soon" />
+        <MenuItem
+          label={isZoomedTile ? 'Exit Digital Zoom' : 'Digital Zoom'}
+          disabled={!hasContent}
+          onClick={() => runAndDismiss(onToggleZoom)}
+        />
+        {/* No audio pipeline exists anywhere in the app yet (no audio
+            frame type, no IPC channel, no playback code) — Uniview's SDK
+            has an unused audio callback slot ready to wire up, but
+            Hikvision/Dahua/TVT haven't even been checked for what they
+            expose. Real per-vendor native work, not a quick toggle. */}
+        <MenuItem label="Audio" disabled title="Coming soon" />
 
         <div
           onMouseEnter={() => hasContent && setStreamSubmenuOpen(true)}
@@ -115,9 +147,13 @@ export function TileContextMenu({
         </div>
 
         <MenuDivider />
-        <MenuItem label="Snapshot" disabled title="Coming soon" />
-        <MenuItem label="Snapshot All" disabled title="Coming soon" />
-        <MenuItem label="Start Local Recording" disabled title="Coming soon" />
+        <MenuItem label="Snapshot" disabled={!hasContent} onClick={() => runAndDismiss(onSnapshot)} />
+        <MenuItem label="Snapshot All" disabled={!anyTilesFilled} onClick={() => runAndDismiss(onSnapshotAll)} />
+        <MenuItem
+          label={isRecordingThisTile ? 'Stop Local Recording' : 'Start Local Recording'}
+          disabled={!hasContent}
+          onClick={() => runAndDismiss(onToggleRecording)}
+        />
         <MenuDivider />
         <MenuItem label="PTZ Control" disabled title="Coming soon" />
       </div>

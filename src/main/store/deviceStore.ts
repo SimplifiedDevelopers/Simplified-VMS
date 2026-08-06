@@ -102,6 +102,22 @@ export function setDeviceChannels(id: string, channels: ChannelInfo[]): void {
   writeAll(records);
 }
 
+// Live View sidebar's per-channel "Rename" — a purely local, client-side
+// friendly name override (there's no vendor SDK write support for this
+// project's 4 native addons, only read/discovery), so this just edits the
+// label already persisted in this device's own channel list rather than
+// pushing anything to the device itself. Returns the updated list so the
+// caller can push it straight back to the renderer without a second read.
+export function renameDeviceChannel(id: string, channel: number, label: string): ChannelInfo[] | null {
+  const records = readAll();
+  const index = records.findIndex((r) => r.id === id);
+  if (index === -1) return null;
+  const channels = normalizeChannels(records[index].channels).map((c) => (c.channel === channel ? { ...c, label } : c));
+  records[index] = { ...records[index], channels };
+  writeAll(records);
+  return channels;
+}
+
 // Main-process-only — credentials never cross the IPC boundary on read.
 export function getDeviceCredentials(id: string): DeviceCredentials | null {
   const record = readAll().find((r) => r.id === id);

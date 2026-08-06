@@ -49,9 +49,22 @@ export function MiniCalendar({ selectedDate, onSelect, deviceId, channel, filter
     let cancelled = false;
     const monthStartMs = new Date(viewYear, viewMonth, 1).getTime();
     const monthEndMs = new Date(viewYear, viewMonth + 1, 1).getTime();
+    // Diagnostic: reported live that switching devices left the calendar
+    // showing the PREVIOUS device's day dots — not yet reproduced through
+    // static reading (this effect's own deps already include deviceId and
+    // channel, and the cache key in recordingCalendarCache.ts already
+    // includes both too), so logging real values here rather than guessing
+    // further at the cause.
+    // eslint-disable-next-line no-console
+    console.log('[calendar-diag] effect firing deviceId=%s channel=%s month=%d-%d', deviceId, channel, viewYear, viewMonth);
     window.ssmVms.playback
       .findRecordings(deviceId, channel, monthStartMs, monthEndMs, filters, true)
       .then((segments) => {
+        // eslint-disable-next-line no-console
+        console.log(
+          '[calendar-diag] result deviceId=%s channel=%s cancelled=%s segmentCount=%d',
+          deviceId, channel, cancelled, segments.length,
+        );
         if (cancelled) return;
         setRecordingDays(new Set(segments.map((s) => new Date(s.startMs).getDate())));
       })

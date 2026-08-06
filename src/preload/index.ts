@@ -12,6 +12,7 @@ import type {
   DeviceConnectionStatus,
   DiscoveredDevice,
   LastLiveViewState,
+  MediaSaveResult,
   NewDeviceInput,
   PlaybackCommand,
   PopoutTabKind,
@@ -47,6 +48,8 @@ const devices = {
   delete: (id: string): Promise<void> => ipcRenderer.invoke('devices:delete', id),
   testConnection: (input: NewDeviceInput): Promise<ConnectionTestResult> =>
     ipcRenderer.invoke('devices:testConnection', input),
+  renameChannel: (id: string, channel: number, label: string): Promise<ChannelInfo[] | null> =>
+    ipcRenderer.invoke('devices:renameChannel', id, channel, label),
   // Cached status from the app's persistent connection to this device — no
   // network round-trip.
   getStatus: (id: string): Promise<DeviceConnectionStatus | undefined> =>
@@ -145,6 +148,13 @@ const liveView = {
     ipcRenderer.invoke('liveView:saveLastSessionState', state),
   consumeStartupRestoreState: (): Promise<LastLiveViewState | null> =>
     ipcRenderer.invoke('liveView:consumeStartupRestoreState'),
+  peekLastSessionState: (): Promise<LastLiveViewState | null> =>
+    ipcRenderer.invoke('liveView:peekLastSessionState'),
+
+  saveSnapshot: (deviceName: string, channel: number, data: ArrayBuffer): Promise<MediaSaveResult> =>
+    ipcRenderer.invoke('liveView:saveSnapshot', deviceName, channel, data),
+  saveRecording: (deviceName: string, channel: number, data: ArrayBuffer): Promise<MediaSaveResult> =>
+    ipcRenderer.invoke('liveView:saveRecording', deviceName, channel, data),
 };
 
 const playback = {
@@ -192,6 +202,9 @@ const playback = {
 
   stopBackup: (deviceId: string, downloadHandle: string): Promise<void> =>
     ipcRenderer.invoke('playback:stopBackup', deviceId, downloadHandle),
+
+  verifyExportedFile: (filePath: string): Promise<{ ok: boolean; size: number }> =>
+    ipcRenderer.invoke('playback:verifyExportedFile', filePath),
 
   openExportLocation: (filePath: string): Promise<void> => ipcRenderer.invoke('playback:openExportLocation', filePath),
 

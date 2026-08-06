@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron';
-import { addDevice, deleteDevice, listDevices, updateDevice } from '../store/deviceStore';
+import { addDevice, deleteDevice, listDevices, renameDeviceChannel, updateDevice } from '../store/deviceStore';
 import { getAdapter } from '../adapters/registry';
 import { discoverUniviewDevices } from '../adapters/uniview';
 import { discoverTvtDevices } from '../adapters/tvt';
@@ -8,7 +8,7 @@ import { forgetDevice, getAllStatuses, getConnection, getStatus, reconnectDevice
 import { discoverDevices } from '../services/discovery';
 import { getArpTable } from '../services/macLookup';
 import { discoverHikvisionDevices } from '../services/sadp';
-import type { ConnectionTestResult, DiscoveredDevice, NewDeviceInput, StoredDevice, VendorId } from '../../shared/types';
+import type { ChannelInfo, ConnectionTestResult, DiscoveredDevice, NewDeviceInput, StoredDevice, VendorId } from '../../shared/types';
 
 interface Credentials {
   host: string;
@@ -61,6 +61,13 @@ export function registerDeviceIpcHandlers(): void {
 
   ipcMain.handle('devices:testConnection', (_event, input: NewDeviceInput): Promise<ConnectionTestResult> =>
     testLogin(input.vendor, input),
+  );
+
+  // Live View sidebar's per-channel "Rename" - see deviceStore's
+  // renameDeviceChannel doc comment for why this is local-only (no vendor
+  // write support), not pushed to the device itself.
+  ipcMain.handle('devices:renameChannel', (_event, id: string, channel: number, label: string): ChannelInfo[] | null =>
+    renameDeviceChannel(id, channel, label),
   );
 
   // Returns the connection manager's current cached status instantly — no

@@ -7,6 +7,7 @@
 // reverse-engineered. No separate decode library needed.
 #include <napi.h>
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -762,9 +763,24 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
   void Execute() override {
     std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
 
-    // Keyed by [begin,end) so the same range found under multiple type
-    // searches only appears once, keeping whichever type is more specific.
-    std::map<std::pair<INT64, INT64>, std::string> byRange;
+    // continuous is a FILE-level search (wide chunk boundaries, e.g. a
+    // whole hour-long file) while motion/smart are EVENT-level (the
+    // precise, much narrower detection window, typically nested INSIDE a
+    // continuous file's span) - confirmed live these two almost never
+    // share an identical [begin,end) pair. An exact-range dedup (the
+    // previous approach here) therefore never actually merges them: both
+    // the wide continuous segment and the narrow nested motion segment
+    // survive as two separate, overlapping segments, and whichever the
+    // renderer happens to paint on top visually wins - confirmed live as
+    // exactly the bug reported (motion segments showing as a muddied
+    // blue/gray instead of their real orange, painted over by the wider
+    // continuous segment covering the same span). Fixed with a proper
+    // priority sweep: every point in time is covered by whichever
+    // overlapping interval has the highest TypePriority, same "more
+    // specific classification wins" intent as before, now actually
+    // correct for overlapping (not just identical) ranges.
+    struct RawInterval { INT64 begin; INT64 end; int priority; };
+    std::vector<RawInterval> raw;
 
     for (const auto& search : searches_) {
       std::vector<std::pair<INT64, INT64>> ranges;
@@ -779,16 +795,73 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
         ranges = SearchByFile(lUserID_, channel_, beginTime_, endTime_, search.values[0]);
       }
 
+      // Diagnostic only (not yet confirmed live): whether real Uniview
+      // motion/smart events ever come back as zero-width (begin==end) or
+      // inverted (end<begin) ranges is unknown, so nothing is filtered out
+      // here based on width - unlike an earlier version of this fix, which
+      // speculatively dropped non-positive-width ranges and needs to be
+      // ruled out as the cause if "Motion" alone still comes back empty.
+      const int priority = TypePriority(search.label);
+      fprintf(stderr, "[unv-diag] findRecordings type=%s isEvent=%d rawCount=%zu\n", search.label.c_str(),
+              search.isEventSearch ? 1 : 0, ranges.size());
+      int logged = 0;
       for (const auto& range : ranges) {
-        auto it = byRange.find(range);
-        if (it == byRange.end() || TypePriority(search.label) > TypePriority(it->second)) {
-          byRange[range] = search.label;
+        if (logged < 10) {
+          fprintf(stderr, "[unv-diag]   range begin=%lld end=%lld width=%lld\n", static_cast<long long>(range.first),
+                  static_cast<long long>(range.second), static_cast<long long>(range.second - range.first));
+          logged++;
         }
+        raw.push_back({range.first, range.second, priority});
       }
     }
 
-    for (const auto& entry : byRange) {
-      segments_.push_back({entry.first.first, entry.first.second, entry.second});
+    // Sweep-line over start/end events, sorted by time. Only 3 priority
+    // levels exist (continuous=1, motion=2, smart=3), so tracking an
+    // active-count per level and taking the highest non-zero one is O(1)
+    // per event rather than needing a full multiset.
+    struct SweepEvent { INT64 time; int priority; int delta; };
+    std::vector<SweepEvent> events;
+    events.reserve(raw.size() * 2);
+    for (const auto& r : raw) {
+      events.push_back({r.begin, r.priority, +1});
+      events.push_back({r.end, r.priority, -1});
+    }
+    std::sort(events.begin(), events.end(), [](const SweepEvent& a, const SweepEvent& b) { return a.time < b.time; });
+
+    int activeCount[4] = {0, 0, 0, 0};  // indices 1..3
+    auto typeForPriority = [](int p) -> std::string {
+      if (p == 3) return "smart";
+      if (p == 2) return "motion";
+      return "continuous";
+    };
+
+    std::vector<std::pair<INT64, INT64>> merged;
+    std::vector<std::string> mergedTypes;
+    INT64 lastTime = events.empty() ? 0 : events.front().time;
+    size_t idx = 0;
+    while (idx < events.size()) {
+      const INT64 t = events[idx].time;
+      if (t > lastTime) {
+        const int winner = activeCount[3] > 0 ? 3 : activeCount[2] > 0 ? 2 : activeCount[1] > 0 ? 1 : 0;
+        if (winner > 0) {
+          const std::string type = typeForPriority(winner);
+          if (!mergedTypes.empty() && mergedTypes.back() == type && merged.back().second == lastTime) {
+            merged.back().second = t;
+          } else {
+            merged.push_back({lastTime, t});
+            mergedTypes.push_back(type);
+          }
+        }
+        lastTime = t;
+      }
+      while (idx < events.size() && events[idx].time == t) {
+        activeCount[events[idx].priority] += events[idx].delta;
+        idx++;
+      }
+    }
+
+    for (size_t i = 0; i < merged.size(); ++i) {
+      segments_.push_back({merged[i].first, merged[i].second, mergedTypes[i]});
     }
   }
 

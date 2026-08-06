@@ -5,8 +5,8 @@ import { registerAuthIpcHandlers } from './ipc/auth';
 import { registerBackupIpcHandlers } from './ipc/backup';
 import { registerDeviceIpcHandlers } from './ipc/devices';
 import { registerLayoutIpcHandlers } from './ipc/layouts';
-import { registerLiveViewIpcHandlers } from './ipc/liveView';
-import { registerPlaybackIpcHandlers } from './ipc/playback';
+import { beginQuitting as beginQuittingLiveView, registerLiveViewIpcHandlers, waitForPendingLiveViewCalls } from './ipc/liveView';
+import { beginQuitting as beginQuittingPlayback, registerPlaybackIpcHandlers, waitForPendingPlaybackCalls } from './ipc/playback';
 import { registerPrefsIpcHandlers } from './ipc/prefs';
 import { registerSettingsIpcHandlers } from './ipc/settings';
 import { registerSystemIpcHandlers } from './ipc/system';
@@ -16,7 +16,7 @@ import { connectAll, disconnectAll, onStatusChange, startHeartbeat } from './ser
 import { registerFrameAckHandler } from './services/frameBackpressure';
 import { startStatsBroadcast, stopStatsBroadcast } from './services/systemStats';
 import { startUpdateStatusBroadcast } from './services/updater';
-import { onSettingsChange, readSettings } from './store/settingsStore';
+import { ensureDefaultMediaFolders, onSettingsChange, readSettings } from './store/settingsStore';
 
 // Must be set before libuv's threadpool is first used (it reads this once,
 // lazily, on first use — safe to set here since no native SDK call happens
@@ -179,6 +179,12 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // Media/Snapshot, Media/Local Recording, Media/Video Backup next to the
+  // installed app — see settingsStore.ts's doc comment for why this isn't
+  // strictly required (each feature already creates its own target folder
+  // on first save) but is still done proactively at startup.
+  ensureDefaultMediaFolders();
+
   registerAuthIpcHandlers();
   registerBackupIpcHandlers();
   registerDeviceIpcHandlers();
@@ -256,5 +262,18 @@ app.on('before-quit', (event) => {
   event.preventDefault();
   quitting = true;
   stopStatsBroadcast();
-  disconnectAll().finally(() => app.quit());
+  // beginQuitting() on both modules FIRST — stops any new native call from
+  // even starting once shutdown is underway (the window stays alive for
+  // the whole wait below, so without this a freshly-dispatched call could
+  // still race past it) — then wait for whatever's already in flight (a
+  // loop, not a one-shot snapshot, for the same reason) alongside
+  // disconnectAll(). Confirmed live as a real crash otherwise: an
+  // in-flight native call (findRecordings, playback/live view start/stop,
+  // backup start, etc.) still running when quit proceeded anyway hit the
+  // exact same "Error::ThrowAsJavaScriptException napi_throw" hard crash
+  // disconnectAll's own inFlight/currentHeartbeatTick tracking exists to
+  // prevent for logins.
+  beginQuittingPlayback();
+  beginQuittingLiveView();
+  Promise.allSettled([disconnectAll(), waitForPendingPlaybackCalls(), waitForPendingLiveViewCalls()]).finally(() => app.quit());
 });
