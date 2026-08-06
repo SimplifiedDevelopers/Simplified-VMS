@@ -1046,7 +1046,7 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
   // LiveViewSession::paceToRealtime's doc comment). Absent/false preserves
   // on-screen Playback's existing kPlaybackFrameIntervalMs-capped behavior
   // exactly.
-  const bool paceToRealtime = info.Length() > 5 && info[5].As<Napi::Boolean>().Value();
+  const bool paceToRealtime = info.Length() > 5 && info[5].IsBoolean() && info[5].As<Napi::Boolean>().Value();
 
   LPVOID lUserID = IdToPointer(sessionId);
   // maxQueueSize=2 (was 0/unbounded) — see the matching comment on the

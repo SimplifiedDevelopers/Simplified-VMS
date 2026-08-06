@@ -762,7 +762,7 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
   // Optional - only clipExporter.ts's export sessions pass true (see
   // LiveViewSession::paceToRealtime's doc comment). Absent/false preserves
   // on-screen Playback's existing, already-working behavior exactly.
-  const bool paceToRealtime = info.Length() > 5 && info[5].As<Napi::Boolean>().Value();
+  const bool paceToRealtime = info.Length() > 5 && info[5].IsBoolean() && info[5].As<Napi::Boolean>().Value();
 
   const LONG lUserID = std::stol(sessionId);
   // maxQueueSize=2 (was 0/unbounded) — see the matching comment on the
