@@ -55,6 +55,7 @@ interface NativeAddon {
     startMs: number,
     endMs: number,
     onFrame: (frame: NativeFrame) => void,
+    paceToRealtime?: boolean,
   ): Promise<string>;
   controlPlayback(viewHandle: string, command: PlaybackCommand, value?: number): Promise<void>;
   getPlaybackTime(viewHandle: string): Promise<number>;
@@ -161,6 +162,11 @@ export class TvtAdapter implements VmsAdapter {
     startMs: number,
     endMs: number,
     onFrame: (frame: DecodedFrame) => void,
+    // Only clipExporter.ts's export sessions pass true - see the native
+    // addon's LiveViewSession::paceToRealtime doc comment for why this
+    // exists (a real app hang, otherwise): on-screen Playback leaves this
+    // unset, preserving its existing behavior exactly.
+    paceToRealtime?: boolean,
   ): Promise<string> {
     return loadNative().startPlayback(sessionId, channel, startMs, endMs, (frame) => {
       onFrame({
@@ -170,7 +176,7 @@ export class TvtAdapter implements VmsAdapter {
         data: frame.data,
         timestampMs: frame.timestampMs,
       });
-    });
+    }, paceToRealtime);
   }
 
   async controlPlayback(viewHandle: string, command: PlaybackCommand, value?: number): Promise<void> {

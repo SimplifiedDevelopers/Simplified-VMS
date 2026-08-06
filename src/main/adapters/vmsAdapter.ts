@@ -71,6 +71,17 @@ export interface VmsAdapter {
     startMs: number,
     endMs: number,
     onFrame: (frame: DecodedFrame) => void,
+    // Requests that the vendor's native decode pace itself to real content
+    // speed instead of delivering frames as fast as it can decode them.
+    // Only clipExporter.ts's export sessions pass true — on-screen
+    // Playback leaves it unset. Confirmed necessary live: an export can't
+    // drop frames the way on-screen preview's own frame-drop/backpressure
+    // check can, so an unpaced native decode floods the main thread with
+    // more real per-frame work (RGBA conversion, a write into ffmpeg's
+    // stdin) than it can drain, which Windows then kills as "not
+    // responding" even though nothing is truly deadlocked. Honored by all
+    // four vendors' native addons.
+    paceToRealtime?: boolean,
   ): Promise<string>;
   controlPlayback?(viewHandle: string, command: PlaybackCommand, value?: number): Promise<void>;
   // Current playback position, for syncing the timeline's scrub cursor while

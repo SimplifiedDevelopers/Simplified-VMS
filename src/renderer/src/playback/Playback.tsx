@@ -282,16 +282,23 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   }, []);
 
   // Pauses/resumes frame delivery for every currently-playing tile based
-  // on whether this tab is the one actually visible (isActive) and,
-  // within that, whether the tile itself is currently displayed (not
-  // hidden behind an expanded tile) — see VmsAdapter.setFrameDelivery's
-  // doc comment and LiveView.tsx's matching effect. A hidden tile's
-  // native session keeps running (so it resumes instantly), it just
-  // stops paying the decode/convert/IPC cost for frames nobody renders —
-  // confirmed via a real resource-usage audit to be a real source of
-  // unnecessary CPU/memory use across a large fleet.
+  // on whether this tab is the one actually visible (isActive), whether
+  // the tile itself is currently displayed (not hidden behind an expanded
+  // tile), and whether that exact device/channel is currently being
+  // exported — see VmsAdapter.setFrameDelivery's doc comment and
+  // LiveView.tsx's matching effect. A hidden/exporting tile's native
+  // session keeps running (so it resumes instantly), it just stops paying
+  // the decode/convert/IPC cost for frames nobody renders. The export case
+  // specifically: exporting already runs its own independent decode
+  // session (clipExporter.ts) for the exact same channel/range — on-screen
+  // preview of that same clip while its own export is running would just
+  // be a second, redundant decode for content the export doesn't need
+  // rendered, on top of everything else already competing for the CPU.
   useEffect(() => {
     let cancelled = false;
+    const exportingKeys = new Set(
+      downloads.filter((d) => !d.done).map((d) => `${d.deviceId}:${d.channel}`),
+    );
     // Pausing is instant for every tile (only ever reduces load); resuming
     // is staggered — see LiveView.tsx's matching effect for why: resuming
     // several tiles' frame delivery in the same instant (e.g. collapsing
@@ -301,7 +308,9 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     const toResume: Array<{ deviceId: string; viewHandle: string }> = [];
     tiles.forEach((tile, index) => {
       if (!tile.deviceId || !tile.viewHandle) return;
-      const shouldDeliver = isActive && (expandedTileIndex === null || expandedTileIndex === index);
+      const isExporting = tile.channel !== null && exportingKeys.has(`${tile.deviceId}:${tile.channel}`);
+      const shouldDeliver =
+        isActive && (expandedTileIndex === null || expandedTileIndex === index) && !isExporting;
       if (shouldDeliver) {
         toResume.push({ deviceId: tile.deviceId, viewHandle: tile.viewHandle });
       } else {
@@ -320,7 +329,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     return () => {
       cancelled = true;
     };
-  }, [isActive, expandedTileIndex, tiles]);
+  }, [isActive, expandedTileIndex, tiles, downloads]);
 
   // Polls every currently-playing (non-paused) tile's position at once,
   // rather than one interval per tile — this vendor's SDK has no

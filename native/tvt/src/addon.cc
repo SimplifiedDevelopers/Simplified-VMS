@@ -48,6 +48,26 @@ struct LiveViewSession {
   // decode session, so resuming is instant. std::atomic since it's
   // written from the N-API call thread and read from the decode callback.
   std::atomic<bool> framePaused{false};
+
+  // Set only by clipExporter.ts's export sessions (see StartPlayback's
+  // extra paceToRealtime argument) - confirmed live as the root cause of a
+  // real app hang: on-screen Playback gets away without any pacing here
+  // because its own frame-drop/backpressure check (frameBackpressure.ts)
+  // is nearly free per callback, but an export can't drop a single frame,
+  // so it does real work (RGBA conversion + a write into ffmpeg's stdin)
+  // on every single one - and this SDK's own YUV callback delivers frames
+  // as fast as it can decode them, not paced to real time. Without this,
+  // that firehose floods the ThreadSafeFunction queue with more real work
+  // per second than the Electron main thread can drain, starving it of
+  // any chance to pump Windows messages - Windows then kills the whole
+  // app as "not responding" (Event ID 1002, confirmed live), even though
+  // nothing is actually deadlocked. Only touched from OnYUVFrame itself
+  // (always the same SDK-owned callback thread for a given handle), so -
+  // unlike framePaused above - these don't need to be atomic.
+  bool paceToRealtime = false;
+  bool paceInitialized = false;
+  int64_t paceFirstContentMs = 0;
+  std::chrono::steady_clock::time_point paceWallStart;
 };
 
 std::mutex g_mutex;
@@ -116,13 +136,39 @@ void CALLBACK OnYUVFrame(POINTERHANDLE lLiveHandle, DECODE_FRAME_INFO frameInfo,
   if (!session) return;
   if (session->framePaused.load(std::memory_order_relaxed)) return;
 
-  auto* frame = new FrameData();
-  frame->width = frameInfo.nWidth;
-  frame->height = frameInfo.nHeight;
   // frameInfo.time is Unix seconds (~1.79 billion currently) - casting to a
   // 32-bit long before multiplying by 1000 overflowed (confirmed live:
   // negative garbage timestamps), hence the explicit int64_t here.
-  frame->timestampMs = static_cast<int64_t>(frameInfo.time) * 1000;
+  const int64_t contentMs = static_cast<int64_t>(frameInfo.time) * 1000;
+
+  // See LiveViewSession::paceToRealtime's doc comment - throttles THIS
+  // callback (the SDK's own decode-delivery thread) to real content pace
+  // before doing any of the expensive conversion/dispatch work below,
+  // rather than trying to throttle after the fact on the JS side (by the
+  // time a frame reaches JS, the CPU/memory-bandwidth cost of decoding and
+  // converting it has already been paid).
+  if (session->paceToRealtime) {
+    if (!session->paceInitialized) {
+      session->paceInitialized = true;
+      session->paceFirstContentMs = contentMs;
+      session->paceWallStart = std::chrono::steady_clock::now();
+    } else {
+      const int64_t elapsedContentMs = contentMs - session->paceFirstContentMs;
+      const auto elapsedWall = std::chrono::steady_clock::now() - session->paceWallStart;
+      const int64_t elapsedWallMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(elapsedWall).count();
+      const int64_t aheadMs = elapsedContentMs - elapsedWallMs;
+      // Capped rather than a strict guarantee - a gap in the recording
+      // (or a seek) can make consecutive frames' timestamps jump by more
+      // than makes sense to actually sleep for.
+      if (aheadMs > 0) Sleep(static_cast<DWORD>(aheadMs > 2000 ? 2000 : aheadMs));
+    }
+  }
+
+  auto* frame = new FrameData();
+  frame->width = frameInfo.nWidth;
+  frame->height = frameInfo.nHeight;
+  frame->timestampMs = contentMs;
   ConvertI420ToRGBA(frameInfo, frame->pixels);
 
   auto status = session->tsfn.NonBlockingCall(
@@ -644,13 +690,14 @@ Napi::Value FindRecordings(const Napi::CallbackInfo& info) {
 class StartPlaybackWorker : public Napi::AsyncWorker {
  public:
   StartPlaybackWorker(Napi::Env env, LONG lUserID, int channel, int64_t beginMs, int64_t endMs,
-                       Napi::ThreadSafeFunction tsfn)
+                       Napi::ThreadSafeFunction tsfn, bool paceToRealtime)
       : Napi::AsyncWorker(env), channel_(channel), beginMs_(beginMs), endMs_(endMs),
         deferred_(Napi::Promise::Deferred::New(env)) {
     session_ = new LiveViewSession();
     session_->lUserID = lUserID;
     session_->tsfn = std::move(tsfn);
     session_->isPlayback = true;
+    session_->paceToRealtime = paceToRealtime;
   }
 
   void Execute() override {
@@ -712,13 +759,17 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
   const int64_t beginMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
   const int64_t endMs = static_cast<int64_t>(info[3].As<Napi::Number>().DoubleValue());
   Napi::Function onFrame = info[4].As<Napi::Function>();
+  // Optional - only clipExporter.ts's export sessions pass true (see
+  // LiveViewSession::paceToRealtime's doc comment). Absent/false preserves
+  // on-screen Playback's existing, already-working behavior exactly.
+  const bool paceToRealtime = info.Length() > 5 && info[5].As<Napi::Boolean>().Value();
 
   const LONG lUserID = std::stol(sessionId);
   // maxQueueSize=2 (was 0/unbounded) — see the matching comment on the
   // live-view StartLiveView's own tsfn creation above for why.
   Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(env, onFrame, "tvt-playback-frame-callback", 2, 1);
 
-  auto* worker = new StartPlaybackWorker(env, lUserID, channel, beginMs, endMs, std::move(tsfn));
+  auto* worker = new StartPlaybackWorker(env, lUserID, channel, beginMs, endMs, std::move(tsfn), paceToRealtime);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;

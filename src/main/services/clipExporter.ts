@@ -221,9 +221,21 @@ export async function startExport(
   armInactivityTimer(handle, job);
 
   try {
-    job.viewHandle = await adapter.startPlayback(sessionId, channel, startMs, endMs, (frame) => {
-      handleFrame(handle, job, frame);
-    });
+    // paceToRealtime=true — see VmsAdapter.startPlayback's doc comment.
+    // Confirmed live as necessary: without it, a vendor whose native
+    // decode isn't paced to real time (no on-screen render forcing it to
+    // wait) floods this callback fast enough to starve Electron's main
+    // thread, which Windows then kills as "not responding."
+    job.viewHandle = await adapter.startPlayback(
+      sessionId,
+      channel,
+      startMs,
+      endMs,
+      (frame) => {
+        handleFrame(handle, job, frame);
+      },
+      true,
+    );
   } catch (err) {
     if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
     jobs.delete(handle);
