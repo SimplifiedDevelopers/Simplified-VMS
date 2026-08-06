@@ -41,6 +41,15 @@ interface ExportJob {
   filePath: string;
   ffmpeg: ChildProcess | null;
   progress: number;
+  // Anchors progress to the first frame's own timestamp rather than
+  // assuming frame.timestampMs is an absolute epoch value comparable to
+  // startMs/endMs - confirmed live as necessary: Uniview's frame
+  // timestamps turned out to be a stream-relative PTS counter, not a
+  // real epoch timestamp, so comparing it directly against startMs always
+  // landed near 0%. Measuring elapsed time FROM the first frame instead
+  // works regardless of whether a vendor's timestamps are epoch-absolute
+  // or stream-relative, as long as they advance at real content speed.
+  firstFrameContentMs: number | null;
   formatChecked: boolean;
   inactivityTimer: ReturnType<typeof setTimeout> | null;
   queue: Buffer[];
@@ -112,7 +121,10 @@ function waitForQueueDrain(job: ExportJob): Promise<void> {
 function handleFrame(handle: string, job: ExportJob, frame: DecodedFrame): void {
   if (job.finalizePromise) return;
   armInactivityTimer(handle, job);
-  job.progress = clamp(((frame.timestampMs - job.startMs) / Math.max(1, job.endMs - job.startMs)) * 100, 0, 100);
+
+  if (job.firstFrameContentMs === null) job.firstFrameContentMs = frame.timestampMs;
+  const elapsedContentMs = frame.timestampMs - job.firstFrameContentMs;
+  job.progress = clamp((elapsedContentMs / Math.max(1, job.endMs - job.startMs)) * 100, 0, 100);
 
   if (!job.formatChecked) {
     job.formatChecked = true;
@@ -211,6 +223,7 @@ export async function startExport(
     filePath,
     ffmpeg: null,
     progress: 0,
+    firstFrameContentMs: null,
     formatChecked: false,
     inactivityTimer: null,
     queue: [],

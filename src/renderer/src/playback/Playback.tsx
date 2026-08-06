@@ -281,6 +281,17 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     };
   }, []);
 
+  // Once a tile's frame delivery gets paused because its own clip is being
+  // exported, it stays paused even after that export finishes — per
+  // explicit request, finishing a download should leave the tile stopped
+  // (search results/timeline still there to pick something else) rather
+  // than silently resuming playback the user never asked to resume. Keyed
+  // by viewHandle rather than device/channel so it only affects THIS
+  // specific playback session — picking a new segment (a fresh
+  // stop+restart, hence a new viewHandle) plays normally, unaffected by a
+  // previous session's completed export.
+  const stayPausedAfterExportRef = useRef<Set<string>>(new Set());
+
   // Pauses/resumes frame delivery for every currently-playing tile based
   // on whether this tab is the one actually visible (isActive), whether
   // the tile itself is currently displayed (not hidden behind an expanded
@@ -309,8 +320,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     tiles.forEach((tile, index) => {
       if (!tile.deviceId || !tile.viewHandle) return;
       const isExporting = tile.channel !== null && exportingKeys.has(`${tile.deviceId}:${tile.channel}`);
+      if (isExporting) stayPausedAfterExportRef.current.add(tile.viewHandle);
+      const staysPaused = stayPausedAfterExportRef.current.has(tile.viewHandle);
       const shouldDeliver =
-        isActive && (expandedTileIndex === null || expandedTileIndex === index) && !isExporting;
+        isActive && (expandedTileIndex === null || expandedTileIndex === index) && !isExporting && !staysPaused;
       if (shouldDeliver) {
         toResume.push({ deviceId: tile.deviceId, viewHandle: tile.viewHandle });
       } else {

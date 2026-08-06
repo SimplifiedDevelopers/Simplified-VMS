@@ -183,7 +183,15 @@ void STDCALL OnDecodedFrame(LPVOID lpPlayHandle, const NETDEV_PICTURE_DATA_S* ps
       // interval-drop cap below - an export can't lose a single frame the
       // way a nobody's-watching preview can. See paceToRealtime's own doc
       // comment for the full reasoning (a confirmed app hang otherwise).
-      const int64_t contentMs = static_cast<int64_t>(pstPictureData->tRenderTime);
+      // tRenderTime is a 90kHz PTS tick count (the standard MPEG/RTP video
+      // clock rate), NOT milliseconds and NOT an absolute/epoch timestamp -
+      // confirmed live: consecutive frames' tRenderTime differed by exactly
+      // 3600 ticks (3600/90000 = 40ms = 25fps, a perfectly ordinary camera
+      // frame rate), while treating that 3600 as 3600ms made pacing think
+      // 3.6 real seconds separated every frame, capping the sleep at 2000ms
+      // per frame forever and making exports crawl. /90 converts ticks to
+      // real milliseconds (90000 ticks/sec ÷ 1000 ms/sec = 90 ticks/ms).
+      const int64_t contentMs = static_cast<int64_t>(pstPictureData->tRenderTime) / 90;
       if (!session->paceInitialized) {
         session->paceInitialized = true;
         session->paceFirstContentMs = contentMs;
@@ -211,7 +219,11 @@ void STDCALL OnDecodedFrame(LPVOID lpPlayHandle, const NETDEV_PICTURE_DATA_S* ps
   auto* frame = new FrameData();
   frame->width = pstPictureData->dwPicWidth;
   frame->height = pstPictureData->dwPicHeight;
-  frame->timestampMs = static_cast<long>(pstPictureData->tRenderTime);
+  // tRenderTime is a 90kHz PTS tick count, not milliseconds - see the
+  // matching conversion (and its doc comment) in the paceToRealtime block
+  // above. Applied here too since this is the value actually exposed to
+  // JS as DecodedFrame.timestampMs.
+  frame->timestampMs = static_cast<long>(pstPictureData->tRenderTime / 90);
   ConvertYV12ToRGBA(pstPictureData, frame->pixels);
 
   auto status = session->tsfn.NonBlockingCall(
