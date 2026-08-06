@@ -729,8 +729,28 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     if (!exportPopup || !exportPopup.path) return;
     const { deviceId, deviceName, channel, channelLabel, startMs, endMs, path } = exportPopup;
     setExportPopup(null);
-    const handle = await window.ssmVms.playback.startBackup(deviceId, channel, startMs, endMs, path);
-    setDownloads((prev) => [...prev, { handle, deviceId, deviceName, channel, channelLabel, path, progress: 0, done: false }]);
+    try {
+      const handle = await window.ssmVms.playback.startBackup(deviceId, channel, startMs, endMs, path);
+      setDownloads((prev) => [...prev, { handle, deviceId, deviceName, channel, channelLabel, path, progress: 0, done: false }]);
+    } catch (err) {
+      // Export is currently disabled server-side (see main/ipc/playback.ts)
+      // — surfaced here in the same Downloads list as a real transfer's
+      // failure would be, rather than the click silently doing nothing.
+      setDownloads((prev) => [
+        ...prev,
+        {
+          handle: `failed-${Date.now()}`,
+          deviceId,
+          deviceName,
+          channel,
+          channelLabel,
+          path,
+          progress: 0,
+          done: true,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      ]);
+    }
   }
 
   function handleCancelExport(): void {

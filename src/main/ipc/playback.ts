@@ -76,11 +76,12 @@ function assertNotQuitting(): void {
 
 // Mirrors main/ipc/liveView.ts closely — same "resolve the persistent
 // session, then talk to the adapter" shape, same disposable-frame try/catch
-// around the push. The main difference is that playback/backup are
-// optional VmsAdapter methods (see the interface's own doc comment) since
-// only Uniview has them implemented so far — every handler here throws a
-// clear "not supported for this vendor yet" error instead of a raw
-// "adapter.xyz is not a function" when called for Hikvision/Dahua/TVT.
+// around the push. playback (startPlayback/etc.) is an optional VmsAdapter
+// method (see the interface's own doc comment) since ONVIF doesn't
+// implement it — those handlers throw a clear "not supported for this
+// vendor yet" error instead of a raw "adapter.xyz is not a function".
+// Export (startBackup/getBackupProgress/stopBackup below) is disabled
+// entirely for now regardless of vendor — see that section's own comment.
 export function registerPlaybackIpcHandlers(): void {
   ipcMain.handle(
     'playback:findRecordings',
@@ -244,64 +245,27 @@ export function registerPlaybackIpcHandlers(): void {
     shell.showItemInFolder(filePath);
   });
 
-  ipcMain.handle(
-    'playback:startBackup',
-    async (
-      _event,
-      deviceId: string,
-      channel: number,
-      startMs: number,
-      endMs: number,
-      filePath: string,
-    ): Promise<string> => {
-      assertNotQuitting();
-      const connection = await ensureConnected(deviceId);
-      if (!connection) throw new Error(`Unable to connect to device: ${deviceId}`);
-      const adapter = getAdapter(connection.vendor);
-      if (!adapter.startBackup) throw new Error(`Export isn't supported for ${connection.vendor} yet`);
-      // Just the "kick off the download" call itself, not the whole
-      // transfer — progress is polled separately (getBackupProgress) and
-      // downloads intentionally keep running in the background after this
-      // resolves, so tracking this specifically (not the download's full
-      // duration) is what keeps quit from hanging on an in-progress export.
-      return tracked(adapter.startBackup(connection.sessionId, channel, startMs, endMs, filePath));
-    },
-  );
-
-  ipcMain.handle(
-    'playback:getBackupProgress',
-    async (_event, deviceId: string, downloadHandle: string): Promise<number> => {
-      assertNotQuitting();
-      const connection = await ensureConnected(deviceId);
-      if (!connection) return 100;
-      const adapter = getAdapter(connection.vendor);
-      if (!adapter.getBackupProgress) return 100;
-      return tracked(adapter.getBackupProgress(downloadHandle));
-    },
-  );
-
-  // Deliberately NOT assertNotQuitting-guarded — same "stop should still
-  // run during quit" reasoning as playback:stop above, so an in-progress
-  // download's native handle gets torn down cleanly instead of orphaned.
-  ipcMain.handle('playback:stopBackup', async (_event, deviceId: string, downloadHandle: string) => {
-    const connection = await ensureConnected(deviceId);
-    if (!connection) return;
-    const adapter = getAdapter(connection.vendor);
-    if (adapter.stopBackup) await tracked(adapter.stopBackup(downloadHandle));
+  // Disabled for this release: every vendor's native "backup"/download SDK
+  // call turned out unreliable in practice (Hikvision/TVT/Uniview
+  // frequently finish "100% done" with a 0-byte file on disk; Dahua never
+  // implemented it at all, so Download just did nothing). Rather than ship
+  // a feature that silently produces broken exports, startBackup throws a
+  // clean, immediate error instead of touching any adapter/vendor SDK at
+  // all — the renderer (Playback.tsx's handleStartExportDownload) catches
+  // this and surfaces it plainly in the Downloads list. The rest of the
+  // export UI (mark start/end, choose/default destination, the Download
+  // button itself) is untouched and stays fully wired for a real,
+  // vendor-agnostic export mechanism to replace this stub.
+  ipcMain.handle('playback:startBackup', async (): Promise<string> => {
+    throw new Error("Video export isn't available in this build yet — coming in a future update.");
   });
 
-  // Confirmed live: TVT's getBackupProgress can report "100% done" for a
-  // transfer that actually failed - its native GetDownloadPos legitimately
-  // returns distinct failure signals (a query failure, and a documented
-  // "network anomaly" code), but native/tvt/src/addon.cc's own doc comment
-  // admits both get clamped to 100 rather than surfaced as a real error,
-  // since the SDK gives no other way to tell "genuinely finished" apart
-  // from "failed, and the handle just isn't queryable anymore" - the
-  // result is a "successful" export that's actually a 0-byte file on disk.
-  // Verified here (once, when the renderer's poll first sees 100%) rather
-  // than trusting the progress signal alone - vendor-agnostic since an
-  // empty "successful" export is always wrong regardless of which SDK
-  // produced it.
+  ipcMain.handle('playback:getBackupProgress', async (): Promise<number> => 100);
+
+  ipcMain.handle('playback:stopBackup', async (): Promise<void> => {});
+
+  // Kept even with the native backup path disabled above — still a useful,
+  // vendor-agnostic sanity check for whenever export is re-enabled.
   ipcMain.handle('playback:verifyExportedFile', (_event, filePath: string): { ok: boolean; size: number } => {
     try {
       const stat = statSync(filePath);
