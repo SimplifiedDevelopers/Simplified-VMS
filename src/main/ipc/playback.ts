@@ -5,6 +5,7 @@ import { getAdapter } from '../adapters/registry';
 import { ensureConnected } from '../services/connectionManager';
 import * as recordingCalendarCache from '../services/recordingCalendarCache';
 import { checkVideoHealth, clearVideoHealth } from '../services/videoHealthCheck';
+import * as clipExporter from '../services/clipExporter';
 import { listDevices } from '../store/deviceStore';
 import { readSettings } from '../store/settingsStore';
 import { forgetFrameHandle, shouldSendFrame } from '../services/frameBackpressure';
@@ -80,8 +81,19 @@ function assertNotQuitting(): void {
 // method (see the interface's own doc comment) since ONVIF doesn't
 // implement it — those handlers throw a clear "not supported for this
 // vendor yet" error instead of a raw "adapter.xyz is not a function".
-// Export (startBackup/getBackupProgress/stopBackup below) is disabled
-// entirely for now regardless of vendor — see that section's own comment.
+//
+// Export (startBackup/getBackupProgress/stopBackup below) deliberately does
+// NOT call the matching optional adapter.startBackup/getBackupProgress/
+// stopBackup methods, even though Hikvision/TVT/Uniview implement them —
+// those vendor-native "backup"/download SDK calls turned out unreliable in
+// practice (frequently a 0-byte file even at "100% done"), and Dahua never
+// implemented it at all. Instead, clipExporter.ts runs the same
+// startPlayback decode path every on-screen preview already uses and
+// encodes the frames straight to the destination file itself with ffmpeg —
+// one mechanism for every vendor that has startPlayback/stopPlayback,
+// rather than four separate (and three broken) vendor-specific ones. The
+// adapters' own startBackup/getBackupProgress/stopBackup are kept in place
+// but intentionally unused, to avoid any native-addon changes here.
 export function registerPlaybackIpcHandlers(): void {
   ipcMain.handle(
     'playback:findRecordings',
@@ -245,27 +257,54 @@ export function registerPlaybackIpcHandlers(): void {
     shell.showItemInFolder(filePath);
   });
 
-  // Disabled for this release: every vendor's native "backup"/download SDK
-  // call turned out unreliable in practice (Hikvision/TVT/Uniview
-  // frequently finish "100% done" with a 0-byte file on disk; Dahua never
-  // implemented it at all, so Download just did nothing). Rather than ship
-  // a feature that silently produces broken exports, startBackup throws a
-  // clean, immediate error instead of touching any adapter/vendor SDK at
-  // all — the renderer (Playback.tsx's handleStartExportDownload) catches
-  // this and surfaces it plainly in the Downloads list. The rest of the
-  // export UI (mark start/end, choose/default destination, the Download
-  // button itself) is untouched and stays fully wired for a real,
-  // vendor-agnostic export mechanism to replace this stub.
-  ipcMain.handle('playback:startBackup', async (): Promise<string> => {
-    throw new Error("Video export isn't available in this build yet — coming in a future update.");
+  ipcMain.handle(
+    'playback:startBackup',
+    async (
+      _event,
+      deviceId: string,
+      channel: number,
+      startMs: number,
+      endMs: number,
+      filePath: string,
+    ): Promise<string> => {
+      assertNotQuitting();
+      const connection = await ensureConnected(deviceId);
+      if (!connection) throw new Error(`Unable to connect to device: ${deviceId}`);
+      const adapter = getAdapter(connection.vendor);
+      // Just the "kick off the export" call itself, not the whole transfer
+      // — progress is polled separately (getBackupProgress) and the export
+      // intentionally keeps running in the background after this resolves,
+      // so tracking this specifically (not the export's full duration) is
+      // what keeps quit from hanging (clipExporter.stopAllExports, wired
+      // into index.ts's before-quit, is what actually tears down an export
+      // still running at quit time).
+      return tracked(clipExporter.startExport(channel, startMs, endMs, filePath, adapter, connection.sessionId));
+    },
+  );
+
+  ipcMain.handle(
+    'playback:getBackupProgress',
+    async (_event, _deviceId: string, downloadHandle: string): Promise<number> => {
+      assertNotQuitting();
+      return clipExporter.getExportProgress(downloadHandle);
+    },
+  );
+
+  // Deliberately NOT assertNotQuitting-guarded — same "stop should still
+  // run during quit" reasoning as playback:stop above, so an in-progress
+  // export's ffmpeg process and native playback session get torn down
+  // cleanly instead of orphaned.
+  ipcMain.handle('playback:stopBackup', async (_event, _deviceId: string, downloadHandle: string) => {
+    await tracked(clipExporter.stopExport(downloadHandle));
   });
 
-  ipcMain.handle('playback:getBackupProgress', async (): Promise<number> => 100);
-
-  ipcMain.handle('playback:stopBackup', async (): Promise<void> => {});
-
-  // Kept even with the native backup path disabled above — still a useful,
-  // vendor-agnostic sanity check for whenever export is re-enabled.
+  // Kept as a final trust-but-verify check even now that export goes
+  // through clipExporter.ts's own ffmpeg pipeline rather than a vendor's
+  // native "backup" SDK call (the original reason this existed: TVT's
+  // native download could report "100% done" for a transfer that had
+  // actually failed, silently producing a 0-byte file). Checked here once,
+  // when the renderer's poll first sees progress reach 100%, rather than
+  // trusting the progress signal alone.
   ipcMain.handle('playback:verifyExportedFile', (_event, filePath: string): { ok: boolean; size: number } => {
     try {
       const stat = statSync(filePath);

@@ -12,6 +12,7 @@ import { registerSettingsIpcHandlers } from './ipc/settings';
 import { registerSystemIpcHandlers } from './ipc/system';
 import { registerUpdatesIpcHandlers } from './ipc/updates';
 import { registerWindowIpcHandlers } from './ipc/windows';
+import { stopAllExports } from './services/clipExporter';
 import { connectAll, disconnectAll, onStatusChange, startHeartbeat } from './services/connectionManager';
 import { registerFrameAckHandler } from './services/frameBackpressure';
 import { startStatsBroadcast, stopStatsBroadcast } from './services/systemStats';
@@ -273,7 +274,22 @@ app.on('before-quit', (event) => {
   // exact same "Error::ThrowAsJavaScriptException napi_throw" hard crash
   // disconnectAll's own inFlight/currentHeartbeatTick tracking exists to
   // prevent for logins.
+  //
+  // stopAllExports() covers a separate gap: a clip export can run for
+  // minutes in the background (clipExporter.ts), well past whatever
+  // pendingCalls/waitForPendingPlaybackCalls tracks (that's just the
+  // initial dispatch, deliberately, so quit doesn't hang on an export's
+  // full duration) — without this, quitting mid-export would leave its
+  // ffmpeg.exe process and native playback session orphaned instead of
+  // torn down. Racing alongside the others in the same allSettled (rather
+  // than a separate await) still lets quit proceed as soon as everything
+  // actually finishes, without an unbounded hang.
   beginQuittingPlayback();
   beginQuittingLiveView();
-  Promise.allSettled([disconnectAll(), waitForPendingPlaybackCalls(), waitForPendingLiveViewCalls()]).finally(() => app.quit());
+  Promise.allSettled([
+    disconnectAll(),
+    waitForPendingPlaybackCalls(),
+    waitForPendingLiveViewCalls(),
+    stopAllExports(),
+  ]).finally(() => app.quit());
 });

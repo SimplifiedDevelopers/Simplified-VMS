@@ -1,18 +1,18 @@
-import { join } from 'path';
 import { randomUUID } from 'crypto';
-import { execFile, spawn, type ChildProcess } from 'child_process';
-import { app } from 'electron';
+import { spawn, type ChildProcess } from 'child_process';
 import type { DecodedFrame, DeviceSession, LoginParams, StreamType } from '../../shared/types';
 import type { VmsAdapter } from './vmsAdapter';
 import { getProfiles, getStreamUri, withRtspCredentials, type OnvifAuth, type OnvifProfile } from '../services/onvifClient';
+import { resolveFfmpegPath, resolveFfprobePath } from '../services/ffmpegPath';
+import { killProcessTree } from '../services/processTree';
 
 // Unlike the other 4 vendors, ONVIF has no proprietary SDK to wrap in a
 // native addon — it's just a standard way to log in and ask for an RTSP
 // stream URL. There's no decoder included, so real live view needs an
 // actual decoding pipeline: ffmpeg, spawned per-stream, decoding RTSP into
-// raw RGBA frames. This is the first child_process usage in the codebase
-// (every other vendor's video path goes through a native N-API addon
-// instead) — no existing process-lifecycle convention to follow here.
+// raw RGBA frames (the ffmpeg spawn/kill conventions here — ffmpegPath.ts,
+// processTree.ts — are shared with services/clipExporter.ts's own
+// encode-direction ffmpeg pipeline).
 //
 // ffmpeg is told to output raw RGBA directly (`-pix_fmt rgba`) so the
 // result slots into the exact same DecodedFrame{format:'rgb32', ...}
@@ -36,18 +36,6 @@ interface OnvifStream {
 
 const sessions = new Map<string, OnvifSession>();
 const streams = new Map<string, OnvifStream>();
-
-function resolveFfmpegPath(): string {
-  if (app.isPackaged) return join(process.resourcesPath, 'ffmpeg.exe');
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('ffmpeg-static') as string;
-}
-
-function resolveFfprobePath(): string {
-  if (app.isPackaged) return join(process.resourcesPath, 'ffprobe.exe');
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return (require('ffprobe-static') as { path: string }).path;
-}
 
 interface StreamDimensions {
   width: number;
@@ -105,18 +93,6 @@ async function probeDimensionsWithRetry(rtspUrl: string): Promise<StreamDimensio
   } catch {
     return probeDimensions(rtspUrl);
   }
-}
-
-function killProcessTree(proc: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    if (!proc.pid) {
-      resolve();
-      return;
-    }
-    // Plain SIGTERM/.kill() doesn't reliably tear down ffmpeg's process
-    // tree on Windows — taskkill /T (tree) /F (force) does.
-    execFile('taskkill', ['/pid', String(proc.pid), '/T', '/F'], () => resolve());
-  });
 }
 
 export class OnvifAdapter implements VmsAdapter {

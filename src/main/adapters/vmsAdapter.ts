@@ -79,10 +79,14 @@ export interface VmsAdapter {
   getPlaybackTime?(viewHandle: string): Promise<number>;
   stopPlayback?(viewHandle: string): Promise<void>;
 
-  // Exports a time range directly to a local file — the vendor SDK streams
-  // straight to disk rather than the app receiving decoded frames, so this
-  // is a genuinely separate operation from startPlayback, not a variant of
-  // it. Returns a handle for progress polling / cancellation.
+  // Exports a time range directly to a local file via the vendor SDK's own
+  // "backup"/download call, streaming straight to disk rather than the app
+  // receiving decoded frames. Superseded by main/services/clipExporter.ts,
+  // which instead re-records startPlayback's own frames through ffmpeg —
+  // these vendor-native backup calls turned out unreliable in practice
+  // (frequently a 0-byte file even at "100% done") and are no longer called
+  // from anywhere; kept implemented (where they already were) only to avoid
+  // touching native addon code for a path nothing uses anymore.
   startBackup?(sessionId: string, channel: number, startMs: number, endMs: number, saveFilePath: string): Promise<string>;
   // 0-100. Vendors without a dedicated progress callback derive this by
   // polling current download position against the requested time range.
