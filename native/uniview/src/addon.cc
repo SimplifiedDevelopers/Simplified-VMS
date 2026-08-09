@@ -662,7 +662,16 @@ std::vector<TypeSearch> DetermineSearches(const std::vector<std::string>& filter
   auto continuousSearch = TypeSearch{"continuous", false, {static_cast<UINT32>(NETDEV_RECORD_SEARCH_TYPE_COMMON)}};
   if (quick) return {continuousSearch};
 
-  auto motionSearch = TypeSearch{"motion", true, {static_cast<UINT32>(NETDEV_EVENT_RECORD_TYPE_MOVE_DETECT)}};
+  // Was an event search (NETDEV_FindEventRecordList, NETDEV_EVENT_RECORD_
+  // TYPE_MOVE_DETECT) - confirmed live to fail with NETDEV_E_CONNECT_ERROR
+  // (200) on every single call on real hardware that DOES have genuine
+  // motion-recorded footage (confirmed against the device's own official
+  // client, which shows it fine in its timeline), so the gap is in this
+  // integration, not the device/firmware. Switched to the same file search
+  // (NETDEV_FindFile_V30) continuous already uses reliably, with its own
+  // dedicated motion bitmask - coarser boundaries (whole recording-file
+  // spans, not the precise detection window) but actually returns data.
+  auto motionSearch = TypeSearch{"motion", false, {static_cast<UINT32>(NETDEV_RECORD_SEARCH_TYPE_MOTION)}};
   // Human/vehicle/face/line-crossing/area-intrusion detection - matches
   // what the user asked "Smart" to mean, using the SDK's own more granular
   // per-detection-type event enum rather than the file search's much
@@ -784,13 +793,31 @@ std::vector<std::pair<INT64, INT64>> SearchByEvent(LPVOID lUserID, UINT32 channe
 
   NETDEV_BATCH_OPERATE_BASIC_S resultInfo = {};
   LPVOID findHandle = NETDEV_FindEventRecordList(lUserID, &param, &resultInfo);
-  if (!findHandle) return out;
+  if (!findHandle) {
+    // Confirmed live: NETDEV_FindEventRecordList fails with
+    // NETDEV_E_CONNECT_ERROR (200) on the very first call after a fresh
+    // connect, on every event type tried - not occasional, not specific to
+    // Motion. A brief pause + one retry recovers this on real hardware
+    // (same "first call after connect is flaky, retry succeeds" shape as
+    // onvif.ts's own ffprobe retry).
+    Sleep(300);
+    findHandle = NETDEV_FindEventRecordList(lUserID, &param, &resultInfo);
+  }
+  if (!findHandle) {
+    fprintf(stderr, "[unv-event-diag] NETDEV_FindEventRecordList NULL after retry eventType=%u error=%d\n", eventType,
+            NETDEV_GetLastError());
+    fflush(stderr);
+    return out;
+  }
 
   NETDEV_EVENT_RECORD_INFO_S info = {};
   while (NETDEV_FindNextEventRecordInfo(findHandle, &info)) {
     out.push_back({static_cast<INT64>(info.udwBegin), static_cast<INT64>(info.udwEnd)});
   }
   NETDEV_FindCloseEventRecordList(findHandle);
+  fprintf(stderr, "[unv-event-diag] eventType=%u resultInfo.udwTotal=%u collected=%zu\n", eventType,
+          resultInfo.udwTotal, out.size());
+  fflush(stderr);
   return out;
 }
 
