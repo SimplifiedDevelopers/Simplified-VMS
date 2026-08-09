@@ -163,6 +163,17 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   const [tiles, setTiles] = useState<PlaybackTileState[]>(() => Array.from({ length: MAX_TILES }, emptyTile));
   const tilesRef = useRef(tiles);
   tilesRef.current = tiles;
+  // Set the moment app quit genuinely starts (main/index.ts's before-quit,
+  // via system:appQuitting) — checked by every setInterval-based poll
+  // below so they stop calling into the main process immediately instead
+  // of continuing to hit its now-thrown "App is closing." for however
+  // long the rest of quit's own cleanup takes. Confirmed live: without
+  // this, the getTime poll alone kept firing every second for the whole
+  // wait, each one logged as a real (if harmless) "Error occurred in
+  // handler" — pure noise stacked on top of the exact wait this exists to
+  // keep short.
+  const appQuittingRef = useRef(false);
+  useEffect(() => window.ssmVms.system.onAppQuitting(() => (appQuittingRef.current = true)), []);
   // Guards playTileFrom against overlapping invocations for the SAME tile
   // — confirmed live as a real bug: a slow vendor's stop()/start() (Dahua,
   // whose native stop/start calls can take a long time) leaves a wide
@@ -368,6 +379,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // be a second, redundant decode for content the export doesn't need
   // rendered, on top of everything else already competing for the CPU.
   useEffect(() => {
+    if (appQuittingRef.current) return;
     let cancelled = false;
     const exportingKeys = new Set(
       downloads.filter((d) => !d.done).map((d) => `${d.deviceId}:${d.channel}`),
@@ -413,6 +425,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // cursor honest simultaneously.
   useEffect(() => {
     const interval = setInterval(() => {
+      if (appQuittingRef.current) return;
       tilesRef.current.forEach((t, i) => {
         if (!t.deviceId || !t.viewHandle || t.isPaused) return;
         window.ssmVms.playback.getTime(t.deviceId, t.viewHandle).then((ms) => {
@@ -434,6 +447,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // is frozen server-side until Resume, so there's nothing new to poll for.
   useEffect(() => {
     const interval = setInterval(() => {
+      if (appQuittingRef.current) return;
       setDownloads((prev) => {
         const active = prev.filter((d) => !d.done && !d.paused);
         if (active.length === 0) return prev;

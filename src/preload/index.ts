@@ -284,6 +284,17 @@ const system = {
     ipcRenderer.on('system:windowMaximizedChanged', listener);
     return () => ipcRenderer.removeListener('system:windowMaximizedChanged', listener);
   },
+  // Fired once quit is genuinely proceeding (main/index.ts's before-quit,
+  // right before it starts rejecting new playback/liveView calls) —
+  // distinct from onRequestCloseConfirm above, which fires earlier and
+  // could still be cancelled. Lets a component stop its own polling
+  // (e.g. Playback's 1-second getTime interval) immediately instead of
+  // continuing to hit "App is closing." errors for the rest of the wait.
+  onAppQuitting: (callback: () => void): (() => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on('system:appQuitting', listener);
+    return () => ipcRenderer.removeListener('system:appQuitting', listener);
+  },
   // Live CPU/memory usage of the machine running the app, pushed every 2s —
   // shown in the Live View toolbar so the user can tell if the machine is
   // under strain from decoding many channels at once.

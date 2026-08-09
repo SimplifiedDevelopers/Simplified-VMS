@@ -284,6 +284,21 @@ app.on('before-quit', (event) => {
   // torn down. Racing alongside the others in the same allSettled (rather
   // than a separate await) still lets quit proceed as soon as everything
   // actually finishes, without an unbounded hang.
+  //
+  // Broadcast BEFORE beginQuitting*() below, not after - this is the
+  // renderer's only signal that new calls are about to start being
+  // rejected. Confirmed live: Playback's own 1-second getTime poll (and,
+  // less often, the frame-delivery pause effect) kept firing for the
+  // whole rest of this wait with no way to know quitting had started,
+  // each one hitting assertNotQuitting's thrown "App is closing." and
+  // logging an "Error occurred in handler" - pure noise, but real
+  // overhead stacked on top of the wait this event exists to keep short.
+  // Distinct from system:requestCloseConfirm, which fires BEFORE the user
+  // confirms and could still be cancelled - this fires only once the
+  // close is truly proceeding.
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('system:appQuitting');
+  }
   beginQuittingPlayback();
   beginQuittingLiveView();
   Promise.allSettled([
