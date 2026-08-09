@@ -638,12 +638,35 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     });
   }
 
-  // Assigning a channel always targets the currently selected tile
+  // A tile counts as busy if it's actively playing (viewHandle set) or has
+  // an in-progress download for its exact device/channel — an export pauses
+  // on-screen playback (see the frame-delivery effect below), so viewHandle
+  // alone would miss a tile that's mid-download but currently paused.
+  function isTileBusy(tile: PlaybackTileState): boolean {
+    if (tile.viewHandle !== null) return true;
+    return (
+      tile.deviceId !== null &&
+      tile.channel !== null &&
+      downloads.some((d) => !d.done && d.deviceId === tile.deviceId && d.channel === tile.channel)
+    );
+  }
+
+  // Assigning a channel normally targets the currently selected tile
   // (there's always exactly one selected, unlike Live View where selection
-  // can be cleared) — overwrites whatever was there, stopping its playback
-  // first.
+  // can be cleared) — but overwriting a busy tile would kill an in-progress
+  // playback session or export. If the selected tile is busy, land in the
+  // next empty tile within the current layout instead (and select it), so
+  // the busy tile is left running untouched. Falls back to the selected
+  // tile if every visible tile is busy.
   async function assignChannelToTile(deviceId: string, channel: number): Promise<void> {
-    const index = selectedTileIndex;
+    let index = selectedTileIndex;
+    if (isTileBusy(tilesRef.current[index])) {
+      const freeIndex = tilesRef.current.findIndex((t, i) => i < layout && t.deviceId === null);
+      if (freeIndex !== -1) {
+        index = freeIndex;
+        setSelectedTileIndex(freeIndex);
+      }
+    }
     // Diagnostic: reported live that switching devices leaves the calendar
     // showing the previous device's day dots and the day-view search
     // finding nothing for the newly picked one — logging the actual
