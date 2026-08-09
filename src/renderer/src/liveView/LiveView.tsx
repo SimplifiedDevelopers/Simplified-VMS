@@ -123,6 +123,22 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   // are already addressed. See main/services/videoHealthCheck.ts: only
   // updated on an actual health transition, not continuously.
   const [videoHealthByHandle, setVideoHealthByHandle] = useState<Record<string, boolean>>({});
+
+  // Thin wrapper around the real IPC stop call that also prunes this
+  // viewHandle out of videoHealthByHandle — that Record otherwise keeps
+  // growing forever (every viewHandle this tab has ever played, across
+  // every reassign/close/layout switch for the whole session) since nothing
+  // was pruning it before. Mirrors the equivalent fix already applied to
+  // Playback.tsx's own copy of this same gap.
+  function stopViewHandle(deviceId: string, viewHandle: string): Promise<void> {
+    setVideoHealthByHandle((prev) => {
+      if (!(viewHandle in prev)) return prev;
+      const next = { ...prev };
+      delete next[viewHandle];
+      return next;
+    });
+    return window.ssmVms.liveView.stop(deviceId, viewHandle);
+  }
   // Single click selects a tile (highlighted outline) as the target for the
   // next channel picked from the sidebar, instead of always falling back to
   // "first empty tile" — lets you point at a specific spot in the grid
@@ -437,7 +453,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   useEffect(() => {
     return () => {
       Object.values(tilesRef.current).forEach((tile) => {
-        if (tile.viewHandle) window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle);
+        if (tile.viewHandle) stopViewHandle(tile.deviceId, tile.viewHandle);
       });
       // Closing the Live View tab (as opposed to just switching away from
       // it, which keeps this component mounted-but-hidden - see AppShell's
@@ -593,7 +609,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
       // function forever with nothing to catch it, unlike start() which
       // already has withTimeout below.
       await withTimeout(
-        window.ssmVms.liveView.stop(existing.deviceId, existing.viewHandle),
+        stopViewHandle(existing.deviceId, existing.viewHandle),
         START_TIMEOUT_MS,
       ).catch(() => undefined);
     }
@@ -617,7 +633,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     startPromise.then(
       (viewHandle) => {
         if (tileGenerationRef.current[tileIndex] === myGeneration) return; // handled by the normal path below
-        window.ssmVms.liveView.stop(deviceId, viewHandle).catch(() => undefined);
+        stopViewHandle(deviceId, viewHandle).catch(() => undefined);
       },
       () => undefined,
     );
@@ -748,7 +764,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
 
     await Promise.all(
       Object.values(tilesRef.current).map((tile) =>
-        tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
+        tile.viewHandle ? stopViewHandle(tile.deviceId, tile.viewHandle) : Promise.resolve(),
       ),
     );
     if (token !== gridOperationTokenRef.current) return;
@@ -785,7 +801,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
 
     await Promise.all(
       Object.values(tilesRef.current).map((tile) =>
-        tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
+        tile.viewHandle ? stopViewHandle(tile.deviceId, tile.viewHandle) : Promise.resolve(),
       ),
     );
     if (token !== gridOperationTokenRef.current) return;
@@ -810,7 +826,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     // the user explicitly emptied.
     tileGenerationRef.current[tileIndex] = (tileGenerationRef.current[tileIndex] ?? 0) + 1;
     if (tile?.viewHandle) {
-      await window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle);
+      await stopViewHandle(tile.deviceId, tile.viewHandle);
     }
     setTiles((prev) => {
       const next = { ...prev };
@@ -857,7 +873,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     const overflowing = Object.entries(tilesRef.current).filter(([tileIndex]) => Number(tileIndex) >= next);
     await Promise.all(
       overflowing.map(([, tile]) =>
-        tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
+        tile.viewHandle ? stopViewHandle(tile.deviceId, tile.viewHandle) : Promise.resolve(),
       ),
     );
     if (overflowing.length > 0) {
@@ -904,7 +920,7 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
 
     await Promise.all(
       Object.values(tilesRef.current).map((tile) =>
-        tile.viewHandle ? window.ssmVms.liveView.stop(tile.deviceId, tile.viewHandle) : Promise.resolve(),
+        tile.viewHandle ? stopViewHandle(tile.deviceId, tile.viewHandle) : Promise.resolve(),
       ),
     );
     setTiles({});

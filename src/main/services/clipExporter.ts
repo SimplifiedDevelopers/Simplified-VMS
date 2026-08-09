@@ -33,6 +33,43 @@ const MAX_QUEUED_FRAMES = 300;
 // before falling back to a hard kill.
 const FFMPEG_EXIT_GRACE_MS = 3000;
 
+// How long to wait for the vendor's native stopPlayback call before giving
+// up on it and killing ffmpeg anyway. Confirmed live: an export's ffmpeg
+// process (and the CPU it was burning) outlived both Stop being clicked and
+// the Playback tab being closed — the native stop call itself is a real
+// network round trip to the device (same class of call already known to be
+// slow on some vendors/devices), and without a timeout here a stuck one
+// would block this whole finalize path, and the ffmpeg process it's
+// supposed to clean up, forever.
+const NATIVE_STOP_TIMEOUT_MS = 5000;
+
+function withTimeout(promise: Promise<void>, ms: number, label: string): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // eslint-disable-next-line no-console
+      console.error(`[clipExporter] ${label} did not resolve within ${ms}ms — proceeding without it`);
+      resolve();
+    }, ms);
+    promise.then(
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      },
+    );
+  });
+}
+
 interface ExportJob {
   adapter: VmsAdapter;
   // Kept so pauseExport/resumeExport can re-open a fresh native playback
@@ -163,6 +200,14 @@ function handleFrame(handle: string, job: ExportJob, frame: DecodedFrame): void 
       '-i', 'pipe:0',
       '-an',
       '-c:v', 'libx264',
+      // libx264's default preset ('medium') was confirmed live to sustain
+      // 55-96% CPU across all 4 vendors during an export, not just Dahua —
+      // 'medium' spends real CPU searching for smaller output at a fixed
+      // quality; 'veryfast' trades some of that compression efficiency
+      // (a somewhat larger file) for dramatically less per-frame encode
+      // work, which is the right trade for an evidence-clip export where
+      // the recording itself is already lossy-compressed by the camera.
+      '-preset', 'veryfast',
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart',
       '-loglevel', 'error',
@@ -190,12 +235,12 @@ function finalize(handle: string): Promise<void> {
 async function doFinalize(handle: string, job: ExportJob): Promise<void> {
   if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
 
-  if (job.viewHandle) {
-    try {
-      await job.adapter.stopPlayback?.(job.viewHandle);
-    } catch {
-      // best-effort — matches playback:stop's own tone elsewhere
-    }
+  if (job.viewHandle && job.adapter.stopPlayback) {
+    await withTimeout(
+      job.adapter.stopPlayback(job.viewHandle).catch(() => undefined),
+      NATIVE_STOP_TIMEOUT_MS,
+      'stopPlayback (finalize)',
+    );
   }
 
   if (job.ffmpeg) {
@@ -310,12 +355,12 @@ export async function pauseExport(handle: string): Promise<void> {
   if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
   const viewHandle = job.viewHandle;
   job.viewHandle = null;
-  if (viewHandle) {
-    try {
-      await job.adapter.stopPlayback?.(viewHandle);
-    } catch {
-      // best-effort — matches playback:stop's own tone elsewhere
-    }
+  if (viewHandle && job.adapter.stopPlayback) {
+    await withTimeout(
+      job.adapter.stopPlayback(viewHandle).catch(() => undefined),
+      NATIVE_STOP_TIMEOUT_MS,
+      'stopPlayback (pause)',
+    );
   }
 }
 

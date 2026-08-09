@@ -297,6 +297,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // by type, each downloadable directly at its own exact start/end instead
   // of requiring the user to scrub and mark points manually.
   const [fileListFilter, setFileListFilter] = useState<'all' | 'continuous' | 'motion'>('all');
+  // Collapsed to a thin strip (just an expand button) to reclaim grid
+  // width when the file list isn't needed — mirrors the chevron pattern
+  // Live View's own sidebar sections already use.
+  const [fileListCollapsed, setFileListCollapsed] = useState(false);
 
   // Dismissing (or Cancel-ing) the last remaining download left the popup
   // open showing just its empty "No downloads." state instead of actually
@@ -354,50 +358,50 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     };
   }, []);
 
-  // Once a tile's frame delivery gets paused because its own clip is being
-  // exported, it stays paused even after that export finishes — per
-  // explicit request, finishing a download should leave the tile stopped
-  // (search results/timeline still there to pick something else) rather
-  // than silently resuming playback the user never asked to resume. Keyed
-  // by viewHandle rather than device/channel so it only affects THIS
-  // specific playback session — picking a new segment (a fresh
-  // stop+restart, hence a new viewHandle) plays normally, unaffected by a
-  // previous session's completed export.
-  const stayPausedAfterExportRef = useRef<Set<string>>(new Set());
-
-  // Pauses/resumes frame delivery for every currently-playing tile based
-  // on whether this tab is the one actually visible (isActive), whether
-  // the tile itself is currently displayed (not hidden behind an expanded
-  // tile), and whether that exact device/channel is currently being
-  // exported — see VmsAdapter.setFrameDelivery's doc comment and
-  // LiveView.tsx's matching effect. A hidden/exporting tile's native
-  // session keeps running (so it resumes instantly), it just stops paying
-  // the decode/convert/IPC cost for frames nobody renders. The export case
-  // specifically: exporting already runs its own independent decode
-  // session (clipExporter.ts) for the exact same channel/range — on-screen
-  // preview of that same clip while its own export is running would just
-  // be a second, redundant decode for content the export doesn't need
-  // rendered, on top of everything else already competing for the CPU.
+  // Pauses frame delivery for every hidden tile (tab not active, or another
+  // tile expanded over it) so its native session keeps running invisibly
+  // and resumes instantly, no reconnect, once visible again — see
+  // VmsAdapter.setFrameDelivery's doc comment and LiveView.tsx's matching
+  // effect. A tile whose exact device/channel is currently being exported
+  // is handled differently below: pausing alone wasn't enough — confirmed
+  // live, CPU still spiked to 55-96% across all 4 vendors during an export,
+  // because the vendor SDK's own decode still runs on every incoming frame
+  // even when the frame-paused check skips our RGBA conversion/IPC send.
+  // Exporting already runs its own independent decode session
+  // (clipExporter.ts) for the exact same channel/range, so the on-screen
+  // tile's session is fully stopped instead, freeing the SDK decode itself
+  // rather than just the conversion/IPC cost layered on top of it. This
+  // intentionally does not resume once the export finishes (matches the
+  // prior pause-based behavior, which was also one-way per explicit
+  // request) — there's no session left to resume; picking a new segment
+  // starts a fresh one.
   useEffect(() => {
     if (appQuittingRef.current) return;
     let cancelled = false;
     const exportingKeys = new Set(
       downloads.filter((d) => !d.done).map((d) => `${d.deviceId}:${d.channel}`),
     );
-    // Pausing is instant for every tile (only ever reduces load); resuming
-    // is staggered — see LiveView.tsx's matching effect for why: resuming
-    // several tiles' frame delivery in the same instant (e.g. collapsing
-    // an expanded tile back to a full grid) confirmed live to overwhelm
-    // an older machine's renderer badly enough to show "Not Responding,"
-    // even though every underlying native call completed normally.
+    // Pausing/stopping is instant for every tile (only ever reduces load);
+    // resuming is staggered — see LiveView.tsx's matching effect for why:
+    // resuming several tiles' frame delivery in the same instant (e.g.
+    // collapsing an expanded tile back to a full grid) confirmed live to
+    // overwhelm an older machine's renderer badly enough to show "Not
+    // Responding," even though every underlying native call completed
+    // normally.
     const toResume: Array<{ deviceId: string; viewHandle: string }> = [];
     tiles.forEach((tile, index) => {
       if (!tile.deviceId || !tile.viewHandle) return;
       const isExporting = tile.channel !== null && exportingKeys.has(`${tile.deviceId}:${tile.channel}`);
-      if (isExporting) stayPausedAfterExportRef.current.add(tile.viewHandle);
-      const staysPaused = stayPausedAfterExportRef.current.has(tile.viewHandle);
-      const shouldDeliver =
-        isActive && (expandedTileIndex === null || expandedTileIndex === index) && !isExporting && !staysPaused;
+      if (isExporting) {
+        // stopTile also prunes this viewHandle out of videoHealthByHandle —
+        // reused here (instead of calling window.ssmVms.playback.stop
+        // directly) so that cleanup applies on this path too, not just the
+        // explicit close/reassign/research ones.
+        stopTile(index);
+        updateTile(index, { viewHandle: null, isPaused: false, currentMs: null, playStartMs: null, playEndMs: null });
+        return;
+      }
+      const shouldDeliver = isActive && (expandedTileIndex === null || expandedTileIndex === index);
       if (shouldDeliver) {
         toResume.push({ deviceId: tile.deviceId, viewHandle: tile.viewHandle });
       } else {
@@ -422,8 +426,13 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // rather than one interval per tile — this vendor's SDK has no
   // push-based position event, only poll-on-demand (NETDEV_PLAY_CTRL_
   // GETPLAYTIME), so this is the cheapest way to keep every tile's scrub
-  // cursor honest simultaneously.
+  // cursor honest simultaneously. Skipped entirely while this tab isn't the
+  // active one — confirmed live as a real gap: unlike the frame-delivery
+  // effect right below, this kept firing a getTime IPC/native round trip
+  // per playing tile every second even while the user had switched to a
+  // completely different tab (e.g. Live View) and couldn't see the result.
   useEffect(() => {
+    if (!isActive) return;
     const interval = setInterval(() => {
       if (appQuittingRef.current) return;
       tilesRef.current.forEach((t, i) => {
@@ -434,7 +443,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isActive]);
 
   // Guards stopBackup from firing twice for the same handle - the polling
   // interval can see pct>=100 again before the async finalize/verify chain
@@ -532,8 +541,19 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   async function stopTile(index: number): Promise<void> {
     const tile = tilesRef.current[index];
     if (!tile.deviceId || !tile.viewHandle) return;
+    // videoHealthByHandle otherwise keeps every viewHandle this tab has
+    // ever played, forever — confirmed live as unbounded, real growth over
+    // a long session with many channel switches, each getting its own
+    // never-reused handle.
+    const { viewHandle } = tile;
+    setVideoHealthByHandle((prev) => {
+      if (!(viewHandle in prev)) return prev;
+      const next = { ...prev };
+      delete next[viewHandle];
+      return next;
+    });
     try {
-      await window.ssmVms.playback.stop(tile.deviceId, tile.viewHandle);
+      await window.ssmVms.playback.stop(tile.deviceId, viewHandle);
     } catch {
       // ignore — tile is being reset regardless
     }
@@ -1006,6 +1026,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     if (!item) return;
     await window.ssmVms.playback.stopBackup(item.deviceId, handle).catch(() => undefined);
     setDownloads((prev) => prev.filter((d) => d.handle !== handle));
+    finalizingHandlesRef.current.delete(handle);
   }
 
   async function handlePauseDownload(handle: string): Promise<void> {
@@ -1024,6 +1045,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
   function handleDismissDownload(handle: string): void {
     setDownloads((prev) => prev.filter((d) => d.handle !== handle));
+    finalizingHandlesRef.current.delete(handle);
   }
 
   function handleOpenDownloadLocation(path: string): void {
@@ -1558,16 +1580,59 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           manually first. */}
       <div
         style={{
-          width: '220px',
+          width: fileListCollapsed ? '26px' : '220px',
           flexShrink: 0,
           borderLeft: `1px solid ${theme.border}`,
-          padding: '0.75rem',
+          padding: fileListCollapsed ? '0.75rem 0.25rem' : '0.75rem',
           display: 'flex',
           flexDirection: 'column',
           gap: '0.6rem',
         }}
       >
-        <div style={{ fontSize: '11px', color: theme.textMuted }}>RECORDING FILES</div>
+        {fileListCollapsed ? (
+          <button
+            onClick={() => setFileListCollapsed(false)}
+            title="Expand recording files panel"
+            style={{
+              flex: 1,
+              display: 'flex',
+              alignItems: 'flex-start',
+              justifyContent: 'center',
+              background: 'none',
+              border: 'none',
+              color: theme.textMuted,
+              cursor: 'pointer',
+              fontSize: '13px',
+              padding: '0.2rem 0',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = theme.accentHover)}
+            onMouseLeave={(e) => (e.currentTarget.style.color = theme.textMuted)}
+          >
+            ‹
+          </button>
+        ) : (
+          <>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontSize: '11px', color: theme.textMuted }}>RECORDING FILES</span>
+          <button
+            onClick={() => setFileListCollapsed(true)}
+            title="Collapse recording files panel"
+            style={{
+              background: 'none',
+              border: 'none',
+              color: theme.textMuted,
+              cursor: 'pointer',
+              fontSize: '13px',
+              padding: '0.1rem 0.3rem',
+              display: 'flex',
+              lineHeight: 1,
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = theme.accentHover)}
+            onMouseLeave={(e) => (e.currentTarget.style.color = theme.textMuted)}
+          >
+            ›
+          </button>
+        </div>
         <div style={{ display: 'flex', gap: '0.35rem' }}>
           {(['all', 'continuous', 'motion'] as const).map((t) => (
             <button
@@ -1639,6 +1704,8 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             </div>
           ))}
         </div>
+          </>
+        )}
       </div>
 
       {exportPopup && (
