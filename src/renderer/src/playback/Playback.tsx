@@ -196,6 +196,15 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   });
   const [filters, setFilters] = useState<RecordingSearchFilter[]>(['all']);
   const [zoom, setZoom] = useState<(typeof ZOOM_LEVELS)[number]>(1);
+  // Set by "Search by Time" (below) to narrow the timeline/recording-file
+  // search to a specific sub-day window instead of the calendar's default
+  // whole-day range. Cleared whenever a new calendar day is picked, since
+  // that's the "just give me the whole day" action.
+  const [customRangeMs, setCustomRangeMs] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [searchByTimeOpen, setSearchByTimeOpen] = useState(false);
+  const [searchByTimeDate, setSearchByTimeDate] = useState(date);
+  const [searchByTimeStart, setSearchByTimeStart] = useState('00:00');
+  const [searchByTimeEnd, setSearchByTimeEnd] = useState('23:59');
 
   // 'all' is mutually exclusive with the other three checkboxes — checking
   // it clears the rest, and checking any individual type clears 'all'.
@@ -441,14 +450,28 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     setTiles((prev) => prev.map((t, i) => (i === index ? { ...t, ...partial } : t)));
   }
 
+  // The calendar's whole selected day - always this, regardless of any
+  // custom Search by Time window, since the timeline itself keeps its
+  // normal full-day scale (only which recordings get FETCHED narrows; see
+  // activeSearchRangeMs below).
   function dayRangeMs(): { startMs: number; endMs: number } {
     const startMs = new Date(`${date}T00:00:00`).getTime();
     return { startMs, endMs: startMs + DAY_MS };
   }
 
+  // Whole calendar day by default; a custom sub-day window (set by "Search
+  // by Time") overrides that until the next calendar day pick clears it.
+  // Used only to bound the actual findRecordings query - NOT for the
+  // timeline's own visual scale, which stays full-day (dayRangeMs above)
+  // so a narrow search still shows where in the day it falls rather than
+  // stretching to fill the whole bar.
+  function activeSearchRangeMs(): { startMs: number; endMs: number } {
+    return customRangeMs ?? dayRangeMs();
+  }
+
   async function searchTile(index: number, deviceId: string, channel: number): Promise<void> {
     updateTile(index, { searching: true, error: null });
-    const { startMs, endMs } = dayRangeMs();
+    const { startMs, endMs } = activeSearchRangeMs();
     try {
       const segments = await window.ssmVms.playback.findRecordings(deviceId, channel, startMs, endMs, filters);
       updateTile(index, { segments, searching: false });
@@ -544,7 +567,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   useEffect(() => {
     researchAllTiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date, filters]);
+  }, [date, filters, customRangeMs]);
 
   async function playTileFrom(index: number, startMs: number, endMs: number): Promise<void> {
     // See tileTransitionsRef's own doc comment - ignore a re-entrant call
@@ -820,6 +843,23 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     setExportPopup(null);
   }
 
+  const searchByTimeInvalid =
+    new Date(`${searchByTimeDate}T${searchByTimeEnd}:00`).getTime() <=
+    new Date(`${searchByTimeDate}T${searchByTimeStart}:00`).getTime();
+
+  // Sets the narrower window activeSearchRangeMs() then uses instead of
+  // the calendar's default whole day — the effect watching customRangeMs
+  // (alongside date/filters) re-searches every tile automatically once
+  // this resolves, same as picking a new calendar day already does.
+  function handleConfirmSearchByTime(): void {
+    if (searchByTimeInvalid) return;
+    const startMs = new Date(`${searchByTimeDate}T${searchByTimeStart}:00`).getTime();
+    const endMs = new Date(`${searchByTimeDate}T${searchByTimeEnd}:00`).getTime();
+    setCustomRangeMs({ startMs, endMs });
+    setDate(searchByTimeDate);
+    setSearchByTimeOpen(false);
+  }
+
   async function handleStopDownload(handle: string): Promise<void> {
     const item = downloads.find((d) => d.handle === handle);
     if (!item) return;
@@ -1004,14 +1044,32 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
         <MiniCalendar
           selectedDate={date}
-          onSelect={setDate}
+          onSelect={(d) => {
+            // Picking a new calendar day means "show me this whole day" —
+            // clears any narrower window a previous Search by Time set.
+            setCustomRangeMs(null);
+            setDate(d);
+          }}
           deviceId={selectedTile.deviceId}
           channel={selectedTile.channel}
           filters={filters}
         />
 
-        <button onClick={researchAllTiles} style={searchButtonStyle}>
-          Search
+        <button
+          onClick={() => {
+            setSearchByTimeDate(date);
+            setSearchByTimeStart('00:00');
+            setSearchByTimeEnd('23:59');
+            setSearchByTimeOpen(true);
+          }}
+          disabled={!selectedTile.deviceId || selectedTile.channel === null}
+          style={{
+            ...searchButtonStyle,
+            opacity: !selectedTile.deviceId || selectedTile.channel === null ? 0.5 : 1,
+            cursor: !selectedTile.deviceId || selectedTile.channel === null ? 'not-allowed' : 'pointer',
+          }}
+        >
+          Search by Time
         </button>
       </div>
 
@@ -1448,6 +1506,62 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                 style={{ ...searchButtonStyle, opacity: exportPopup.path ? 1 : 0.5, cursor: exportPopup.path ? 'pointer' : 'not-allowed' }}
               >
                 Download
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {searchByTimeOpen && (
+        <Modal width={320} onDismiss={() => setSearchByTimeOpen(false)}>
+          <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+            <div style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Search by Time</div>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+              <span style={{ fontSize: '11.5px', color: theme.textMuted }}>Date</span>
+              <input
+                type="date"
+                value={searchByTimeDate}
+                onChange={(e) => setSearchByTimeDate(e.target.value)}
+                style={popupInputStyle}
+              />
+            </label>
+            <div style={{ display: 'flex', gap: '0.6rem' }}>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: 1 }}>
+                <span style={{ fontSize: '11.5px', color: theme.textMuted }}>Start Time</span>
+                <input
+                  type="time"
+                  value={searchByTimeStart}
+                  onChange={(e) => setSearchByTimeStart(e.target.value)}
+                  style={popupInputStyle}
+                />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: 1 }}>
+                <span style={{ fontSize: '11.5px', color: theme.textMuted }}>End Time</span>
+                <input
+                  type="time"
+                  value={searchByTimeEnd}
+                  onChange={(e) => setSearchByTimeEnd(e.target.value)}
+                  style={popupInputStyle}
+                />
+              </label>
+            </div>
+            {searchByTimeInvalid && (
+              <span style={{ fontSize: '11px', color: theme.danger }}>End time must be after start time.</span>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button onClick={() => setSearchByTimeOpen(false)} style={secondaryButtonStyle}>
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmSearchByTime}
+                disabled={searchByTimeInvalid}
+                style={{
+                  ...searchButtonStyle,
+                  opacity: searchByTimeInvalid ? 0.5 : 1,
+                  cursor: searchByTimeInvalid ? 'not-allowed' : 'pointer',
+                }}
+              >
+                Search
               </button>
             </div>
           </div>
@@ -1907,4 +2021,14 @@ const secondaryButtonStyle: CSSProperties = {
   fontSize: '12.5px',
   cursor: 'pointer',
   flex: 1,
+};
+
+const popupInputStyle: CSSProperties = {
+  padding: '0.5rem 0.6rem',
+  borderRadius: '5px',
+  border: `1px solid ${theme.border}`,
+  background: theme.surface,
+  color: theme.text,
+  fontSize: '13px',
+  outline: 'none',
 };
