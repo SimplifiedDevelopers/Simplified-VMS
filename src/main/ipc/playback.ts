@@ -9,7 +9,8 @@ import * as clipExporter from '../services/clipExporter';
 import { listDevices } from '../store/deviceStore';
 import { readSettings } from '../store/settingsStore';
 import { forgetFrameHandle, shouldSendFrame } from '../services/frameBackpressure';
-import type { DecodedFrame, PlaybackCommand, RecordingSearchFilter, RecordingSegment } from '../../shared/types';
+import { saveMediaFile } from '../services/mediaSave';
+import type { DecodedFrame, MediaSaveResult, PlaybackCommand, RecordingSearchFilter, RecordingSegment } from '../../shared/types';
 
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
@@ -354,4 +355,14 @@ export function registerPlaybackIpcHandlers(): void {
       return { ok: false, size: 0 };
     }
   });
+
+  // Playback tile's own right-click "Snapshot" — same "just write the
+  // already-painted canvas" job as liveView:saveSnapshot, to the same
+  // Settings' Snapshot Path (one shared destination for snapshots
+  // regardless of which tab they were taken from).
+  ipcMain.handle(
+    'playback:saveSnapshot',
+    (_event, deviceName: string, channel: number, data: ArrayBuffer): MediaSaveResult =>
+      saveMediaFile(readSettings().snapshotPath, deviceName, channel, 'png', Buffer.from(data)),
+  );
 }

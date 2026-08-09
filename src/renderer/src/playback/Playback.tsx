@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from 'react';
 import { theme } from '../theme';
 import { VideoCanvas } from '../liveView/VideoCanvas';
+import { DigitalZoomLayer } from '../liveView/DigitalZoom';
+import { TileContextMenu } from '../liveView/TileContextMenu';
 import { MiniCalendar } from './MiniCalendar';
 import { Modal } from '../components/Modal';
 import { CameraOffIcon } from '../components/icons';
@@ -184,6 +186,39 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   // single tile the mouse is over so the individual-close × only appears
   // on hover.
   const [hoveredTileIndex, setHoveredTileIndex] = useState<number | null>(null);
+
+  // Right-click quick menu — same TileContextMenu component Live View
+  // uses, minus Select Stream (playback has no main/sub concept — see
+  // VmsAdapter.startPlayback's own doc comment), Local Recording, and PTZ
+  // (neither makes sense for reviewing already-recorded footage).
+  const [contextMenu, setContextMenu] = useState<{ tileIndex: number; x: number; y: number } | null>(null);
+  // Which tile (if any) has Digital Zoom's interactive mode on — same
+  // convention as Live View's own zoomTileIndex.
+  const [zoomTileIndex, setZoomTileIndex] = useState<number | null>(null);
+  const [gridFullscreen, setGridFullscreen] = useState(false);
+  // Keyed by viewHandle — Snapshot grabs the tile's own live <canvas>
+  // straight off this map rather than keeping a second decode/render path
+  // in sync with what's already on screen (same convention as Live View's
+  // own canvasesRef).
+  const canvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const [actionMessage, setActionMessage] = useState<{ text: string; path?: string } | null>(null);
+  const actionMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function showActionMessage(text: string, path?: string): void {
+    setActionMessage({ text, path });
+    if (actionMessageTimerRef.current) clearTimeout(actionMessageTimerRef.current);
+    actionMessageTimerRef.current = setTimeout(() => setActionMessage(null), 10000);
+  }
+
+  // With only one tile actually on screen — either a genuine 1-camera
+  // layout or any layout with a tile double-click-expanded to fill it —
+  // that tile IS "the" channel for Snapshot/the context menu's implicit
+  // target, whether or not it was ever explicitly clicked. Same fix as
+  // Live View's own getEffectiveSelectedTileIndex.
+  function getEffectiveSelectedTileIndex(): number {
+    if (expandedTileIndex !== null) return expandedTileIndex;
+    return selectedTileIndex;
+  }
 
   // toISOString() is always UTC, not local time - once local time passes
   // whatever hour lines up with UTC midnight (4 PM-ish for US Eastern),
@@ -499,6 +534,75 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     setTiles((prev) => prev.map((t, i) => (i === index ? emptyTile() : t)));
     setExpandedTileIndex((prev) => (prev === index ? null : prev));
   }
+
+  // Context menu's "Close All" — simpler than Live View's own version
+  // (no staggered background loading to cancel here; assignChannelToTile
+  // is a single direct call, not a multi-channel staggered loop).
+  async function closeAllTiles(): Promise<void> {
+    await Promise.all(tilesRef.current.map((_, i) => stopTile(i)));
+    setTiles(Array.from({ length: MAX_TILES }, emptyTile));
+    setExpandedTileIndex(null);
+  }
+
+  // Core snapshot capture for a single tile, shared by the context menu's
+  // own Snapshot item (whichever tile was right-clicked, not necessarily
+  // selected) and Snapshot All (every playing tile at once) — same
+  // convention as Live View's own snapshotTile.
+  async function snapshotTile(tileIndex: number): Promise<{ ok: boolean; path?: string; error?: string }> {
+    const tile = tilesRef.current[tileIndex];
+    if (!tile?.viewHandle) return { ok: false, error: 'Not playing.' };
+    const canvas = canvasesRef.current.get(tile.viewHandle);
+    if (!canvas) return { ok: false, error: 'No frame to capture yet.' };
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) return { ok: false, error: 'No frame to capture yet.' };
+    const buffer = await blob.arrayBuffer();
+    return window.ssmVms.playback.saveSnapshot(tile.deviceName ?? tile.deviceId ?? 'device', tile.channel ?? 0, buffer);
+  }
+
+  async function takeSnapshot(tileIndex?: number): Promise<void> {
+    const idx = tileIndex ?? getEffectiveSelectedTileIndex();
+    const result = await snapshotTile(idx);
+    if (result.ok) showActionMessage(`Snapshot saved to ${result.path}`, result.path);
+    else showActionMessage(`Snapshot failed: ${result.error ?? 'unknown error'}`);
+  }
+
+  async function snapshotAllTiles(): Promise<void> {
+    const filledIndices = tilesRef.current
+      .map((t, i) => (t.viewHandle ? i : -1))
+      .filter((i) => i >= 0);
+    if (filledIndices.length === 0) {
+      showActionMessage('No channels playing.');
+      return;
+    }
+    const results = await Promise.all(filledIndices.map((i) => snapshotTile(i)));
+    const succeeded = results.filter((r) => r.ok).length;
+    showActionMessage(
+      succeeded === results.length
+        ? `Snapshot All: saved ${succeeded} channel${succeeded === 1 ? '' : 's'}.`
+        : `Snapshot All: saved ${succeeded} of ${results.length} channel${results.length === 1 ? '' : 's'}.`,
+    );
+  }
+
+  // Real OS-level fullscreen toggle, available from the context menu.
+  // Unlike Live View's own Full Screen (which also hides its sidebar/
+  // toolbar down to just the grid), Playback keeps its normal layout —
+  // the calendar/search/file-list sidebar stays available since reviewing
+  // footage is a more sidebar-driven workflow than watching a live grid.
+  async function toggleGridFullscreen(): Promise<void> {
+    const next = !gridFullscreen;
+    setGridFullscreen(next);
+    await window.ssmVms.system.setFullScreen(next);
+  }
+
+  useEffect(() => {
+    if (!gridFullscreen) return;
+    function onKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') toggleGridFullscreen();
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gridFullscreen]);
 
   // Drag one tile onto another to swap their on-screen positions - purely a
   // client-side rearrange, no native calls, same reasoning as Live View's
@@ -1371,6 +1475,24 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                   );
                 })()}
             </div>
+            {actionMessage && (
+              <span
+                title={actionMessage.path ? 'Click to open file location' : undefined}
+                onClick={actionMessage.path ? () => window.ssmVms.playback.openExportLocation(actionMessage.path!) : undefined}
+                style={{
+                  fontSize: '11px',
+                  color: actionMessage.path ? theme.accentHover : theme.textMuted,
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  maxWidth: '320px',
+                  cursor: actionMessage.path ? 'pointer' : 'default',
+                  textDecoration: actionMessage.path ? 'underline' : 'none',
+                }}
+              >
+                {actionMessage.text}
+              </span>
+            )}
             <span style={{ fontSize: '11.5px', color: theme.textMuted }}>
               {selectedTile.currentMs ? formatTime(selectedTile.currentMs) : '--:--:--'}
             </span>
@@ -1656,6 +1778,25 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           </div>
         </Modal>
       )}
+
+      {contextMenu && (
+        <TileContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          hasContent={Boolean(tiles[contextMenu.tileIndex]?.deviceId)}
+          isGridFullscreen={gridFullscreen}
+          isZoomedTile={zoomTileIndex === contextMenu.tileIndex}
+          anyTilesFilled={tiles.some((t) => t.deviceId)}
+          showPtz={false}
+          onDismiss={() => setContextMenu(null)}
+          onClose={() => clearTile(contextMenu.tileIndex)}
+          onCloseAll={() => closeAllTiles()}
+          onFullScreen={() => toggleGridFullscreen()}
+          onSnapshot={() => takeSnapshot(contextMenu.tileIndex)}
+          onSnapshotAll={() => snapshotAllTiles()}
+          onToggleZoom={() => setZoomTileIndex((prev) => (prev === contextMenu.tileIndex ? null : contextMenu.tileIndex))}
+        />
+      )}
     </div>
   );
 
@@ -1669,7 +1810,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
         key={i}
         // Only a filled tile can be the drag SOURCE (nothing to swap out of
         // an empty one) - it can still be a drop TARGET either way.
-        draggable={Boolean(tile.deviceId)}
+        // Disabled while this tile is the active Digital Zoom target - a
+        // drag gesture there means "rubber-band select a zoom region", not
+        // "swap tiles" (same convention as Live View's own grid).
+        draggable={Boolean(tile.deviceId) && zoomTileIndex !== i}
         onDragStart={(e) => {
           if (!tile.deviceId) return;
           e.dataTransfer.setData('text/plain', String(i));
@@ -1683,7 +1827,18 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           swapTiles(fromIndex, i);
         }}
         onClick={() => setSelectedTileIndex(i)}
-        onDoubleClick={() => setExpandedTileIndex((prev) => (prev === i ? null : i))}
+        onDoubleClick={() => {
+          // Double-click already collapses/expands the single-channel view,
+          // which is usually exactly when Digital Zoom gets used — exit
+          // zoom at the same time instead of leaving it zoomed in once
+          // back in the full grid (same convention as Live View's grid).
+          if (zoomTileIndex === i) setZoomTileIndex(null);
+          setExpandedTileIndex((prev) => (prev === i ? null : i));
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setContextMenu({ tileIndex: i, x: e.clientX, y: e.clientY });
+        }}
         onMouseEnter={() => setHoveredTileIndex(i)}
         onMouseLeave={() => setHoveredTileIndex((prev) => (prev === i ? null : prev))}
         style={{
@@ -1714,7 +1869,20 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
         {tile.deviceId && (
           <>
-            {tile.viewHandle && <VideoCanvas viewHandle={tile.viewHandle} subscribe={window.ssmVms.playback.onFrame} />}
+            {tile.viewHandle && (
+              <DigitalZoomLayer key={tile.viewHandle} active={zoomTileIndex === i}>
+                <VideoCanvas
+                  viewHandle={tile.viewHandle}
+                  subscribe={window.ssmVms.playback.onFrame}
+                  onCanvasRef={(el) => {
+                    const handle = tile.viewHandle;
+                    if (!handle) return;
+                    if (el) canvasesRef.current.set(handle, el);
+                    else canvasesRef.current.delete(handle);
+                  }}
+                />
+              </DigitalZoomLayer>
+            )}
             {tile.viewHandle && videoHealthByHandle[tile.viewHandle] === false && (
               <Centered>
                 <div

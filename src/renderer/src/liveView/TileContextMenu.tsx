@@ -13,23 +13,34 @@ interface Props {
   isGridFullscreen: boolean;
   // Whether THIS tile (the one right-clicked, not necessarily the
   // toolbar's selected tile) is the one currently recording — drives the
-  // "Start"/"Stop Local Recording" label swap the same way.
-  isRecordingThisTile: boolean;
+  // "Start"/"Stop Local Recording" label swap the same way. Omit (along
+  // with onToggleRecording) to hide the Local Recording item entirely —
+  // Playback's tiles have no local-recording concept.
+  isRecordingThisTile?: boolean;
   // Whether THIS tile is the one currently listening for Digital Zoom's
   // wheel/drag gestures — drives the "Digital Zoom"/"Exit Digital Zoom"
   // label swap the same way Full Screen does (no checkmark, matching that
   // same precedent).
   isZoomedTile: boolean;
-  currentStream: StreamType | undefined;
+  // Select Stream (main/sub) is a live-view-only concept — recorded
+  // playback has no stream-type selection (see VmsAdapter.startPlayback's
+  // own doc comment). Omit currentStream/onSelectStream together to hide
+  // this whole section for Playback's menu.
+  currentStream?: StreamType;
   anyTilesFilled: boolean;
+  // PTZ has no implementation for either feature yet, but Playback (past
+  // recordings) has no sensible use for camera-movement controls at all —
+  // defaults to true (Live View keeps showing the placeholder) so this is
+  // only ever passed false explicitly.
+  showPtz?: boolean;
   onDismiss: () => void;
   onClose: () => void;
   onCloseAll: () => void;
   onFullScreen: () => void;
-  onSelectStream: (streamType: StreamType) => void;
+  onSelectStream?: (streamType: StreamType) => void;
   onSnapshot: () => void;
   onSnapshotAll: () => void;
-  onToggleRecording: () => void;
+  onToggleRecording?: () => void;
   onToggleZoom: () => void;
 }
 
@@ -48,6 +59,7 @@ export function TileContextMenu({
   isZoomedTile,
   currentStream,
   anyTilesFilled,
+  showPtz = true,
   onDismiss,
   onClose,
   onCloseAll,
@@ -112,50 +124,58 @@ export function TileContextMenu({
             expose. Real per-vendor native work, not a quick toggle. */}
         <MenuItem label="Audio" disabled title="Coming soon" />
 
-        <div
-          onMouseEnter={() => hasContent && setStreamSubmenuOpen(true)}
-          onMouseLeave={() => setStreamSubmenuOpen(false)}
-          style={{ position: 'relative' }}
-        >
-          <MenuItem label="Select Stream" disabled={!hasContent} arrow />
-          {streamSubmenuOpen && hasContent && (
-            <div
-              style={{
-                position: 'absolute',
-                left: MENU_WIDTH - 4,
-                top: 0,
-                width: 150,
-                background: theme.panel,
-                border: `1px solid ${theme.border}`,
-                borderRadius: '6px',
-                boxShadow: '0 16px 48px rgba(0, 0, 0, 0.5)',
-                padding: '0.3rem',
-              }}
-            >
-              <MenuItem
-                label="Main Stream"
-                checked={currentStream === 'main'}
-                onClick={() => runAndDismiss(() => onSelectStream('main'))}
-              />
-              <MenuItem
-                label="Sub Stream"
-                checked={currentStream === 'sub'}
-                onClick={() => runAndDismiss(() => onSelectStream('sub'))}
-              />
-            </div>
-          )}
-        </div>
+        {onSelectStream && (
+          <div
+            onMouseEnter={() => hasContent && setStreamSubmenuOpen(true)}
+            onMouseLeave={() => setStreamSubmenuOpen(false)}
+            style={{ position: 'relative' }}
+          >
+            <MenuItem label="Select Stream" disabled={!hasContent} arrow />
+            {streamSubmenuOpen && hasContent && (
+              <div
+                style={{
+                  position: 'absolute',
+                  left: MENU_WIDTH - 4,
+                  top: 0,
+                  width: 150,
+                  background: theme.panel,
+                  border: `1px solid ${theme.border}`,
+                  borderRadius: '6px',
+                  boxShadow: '0 16px 48px rgba(0, 0, 0, 0.5)',
+                  padding: '0.3rem',
+                }}
+              >
+                <MenuItem
+                  label="Main Stream"
+                  checked={currentStream === 'main'}
+                  onClick={() => runAndDismiss(() => onSelectStream('main'))}
+                />
+                <MenuItem
+                  label="Sub Stream"
+                  checked={currentStream === 'sub'}
+                  onClick={() => runAndDismiss(() => onSelectStream('sub'))}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         <MenuDivider />
         <MenuItem label="Snapshot" disabled={!hasContent} onClick={() => runAndDismiss(onSnapshot)} />
         <MenuItem label="Snapshot All" disabled={!anyTilesFilled} onClick={() => runAndDismiss(onSnapshotAll)} />
-        <MenuItem
-          label={isRecordingThisTile ? 'Stop Local Recording' : 'Start Local Recording'}
-          disabled={!hasContent}
-          onClick={() => runAndDismiss(onToggleRecording)}
-        />
-        <MenuDivider />
-        <MenuItem label="PTZ Control" disabled title="Coming soon" />
+        {onToggleRecording && (
+          <MenuItem
+            label={isRecordingThisTile ? 'Stop Local Recording' : 'Start Local Recording'}
+            disabled={!hasContent}
+            onClick={() => runAndDismiss(onToggleRecording)}
+          />
+        )}
+        {showPtz && (
+          <>
+            <MenuDivider />
+            <MenuItem label="PTZ Control" disabled title="Coming soon" />
+          </>
+        )}
       </div>
     </div>
   );

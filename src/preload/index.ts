@@ -214,6 +214,9 @@ const playback = {
 
   openExportLocation: (filePath: string): Promise<void> => ipcRenderer.invoke('playback:openExportLocation', filePath),
 
+  saveSnapshot: (deviceName: string, channel: number, data: ArrayBuffer): Promise<MediaSaveResult> =>
+    ipcRenderer.invoke('playback:saveSnapshot', deviceName, channel, data),
+
   onFrame: onPlaybackFrame,
 
   // See liveView.onVideoHealth's matching comment.

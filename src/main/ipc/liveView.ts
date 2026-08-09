@@ -1,5 +1,3 @@
-import { mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
 import { ipcMain } from 'electron';
 import { getAdapter } from '../adapters/registry';
 import { listDevices } from '../store/deviceStore';
@@ -8,15 +6,8 @@ import { checkVideoHealth, clearVideoHealth } from '../services/videoHealthCheck
 import { forgetFrameHandle, shouldSendFrame } from '../services/frameBackpressure';
 import { getLastLiveViewState, saveLastLiveViewState } from '../store/lastLiveViewStateStore';
 import { readSettings } from '../store/settingsStore';
+import { saveMediaFile } from '../services/mediaSave';
 import type { ChannelInfo, DecodedFrame, LastLiveViewState, MediaSaveResult, StreamType } from '../../shared/types';
-
-function sanitizeForFilename(input: string): string {
-  return input.replace(/[<>:"/\\|?*]+/g, '_').trim() || 'device';
-}
-
-function timestampForFilename(): string {
-  return new Date().toISOString().replace(/[:.]/g, '-');
-}
 
 // Tracks every native (AsyncWorker-backed) call this file dispatches, so
 // app quit (main/index.ts's before-quit) can wait for all of them to
@@ -57,23 +48,6 @@ function tracked<T>(promise: Promise<T>): Promise<T> {
 export async function waitForPendingLiveViewCalls(): Promise<void> {
   while (pendingCalls.size > 0) {
     await Promise.allSettled([...pendingCalls]);
-  }
-}
-
-// Shared by liveView:saveSnapshot and liveView:saveRecording — both are
-// "write this already-encoded buffer from the renderer into the folder
-// configured in Settings" with nothing vendor-specific left to do (the
-// renderer captured the snapshot/recording straight off the tile's own
-// <canvas>, so it already matches exactly what's on screen).
-function saveMediaFile(basePath: string, deviceName: string, channel: number, ext: string, data: Buffer): MediaSaveResult {
-  if (!basePath) return { ok: false, error: 'Set a path in Settings first.' };
-  try {
-    mkdirSync(basePath, { recursive: true });
-    const filePath = join(basePath, `${sanitizeForFilename(deviceName)}_ch${channel}_${timestampForFilename()}.${ext}`);
-    writeFileSync(filePath, data);
-    return { ok: true, path: filePath };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
