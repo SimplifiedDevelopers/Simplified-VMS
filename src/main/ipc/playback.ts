@@ -11,10 +11,36 @@ import { readSettings } from '../store/settingsStore';
 import { forgetFrameHandle, shouldSendFrame } from '../services/frameBackpressure';
 import type { DecodedFrame, PlaybackCommand, RecordingSearchFilter, RecordingSegment } from '../../shared/types';
 
-function defaultExportFileName(deviceId: string, channel: number, startMs: number): string {
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+// Local time (matches what the user actually sees in the timeline/clock),
+// not toISOString()'s UTC — confirmed live as a real bug: a UTC-based
+// filename was reporting a start time 4 hours off from the clip's real
+// (local) start.
+function formatLocalDateAndTime(ms: number): { date: string; time: string } {
+  const d = new Date(ms);
+  return {
+    date: `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`,
+    time: `${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`,
+  };
+}
+
+function defaultExportFileName(deviceId: string, channel: number, startMs: number, endMs: number): string {
   const device = listDevices().find((d) => d.id === deviceId);
   const deviceName = (device?.name ?? deviceId).replace(/[\\/:*?"<>|]/g, '_');
-  return `${deviceName}_ch${channel}_${new Date(startMs).toISOString().replace(/[:.]/g, '-')}.mp4`;
+  // The device's own saved channel label (real camera name, or a
+  // user-applied rename) rather than a vendor-specific raw channel number
+  // — normalizeChannels (deviceStore.ts) already falls back to "Channel N"
+  // for a device whose channel list hasn't been fetched/named yet.
+  const channelLabel = (device?.channels.find((c) => c.channel === channel)?.label ?? `Channel ${channel}`).replace(
+    /[\\/:*?"<>|]/g,
+    '_',
+  );
+  const { date, time: startTime } = formatLocalDateAndTime(startMs);
+  const { time: endTime } = formatLocalDateAndTime(endMs);
+  return `${deviceName}_${channelLabel}_${date}_${startTime}-${endTime}.mp4`;
 }
 
 // Tracks every native (AsyncWorker-backed, running on a libuv thread) call
@@ -221,7 +247,7 @@ export function registerPlaybackIpcHandlers(): void {
   // transfer, instead of the Save dialog itself silently starting it.
   ipcMain.handle(
     'playback:chooseExportPath',
-    async (_event, deviceId: string, channel: number, startMs: number): Promise<string | null> => {
+    async (_event, deviceId: string, channel: number, startMs: number, endMs: number): Promise<string | null> => {
       // The Save dialog itself is the user's explicit confirmation of the
       // destination — no separate chat confirmation needed, same as any
       // other app's "Save As" action. Actually starting the transfer is a
@@ -229,7 +255,7 @@ export function registerPlaybackIpcHandlers(): void {
       // explicit "Download" button.
       const { canceled, filePath } = await dialog.showSaveDialog({
         title: 'Export Recording',
-        defaultPath: defaultExportFileName(deviceId, channel, startMs),
+        defaultPath: defaultExportFileName(deviceId, channel, startMs, endMs),
         filters: [{ name: 'MP4 Video', extensions: ['mp4'] }],
       });
       return canceled || !filePath ? null : filePath;
@@ -244,10 +270,10 @@ export function registerPlaybackIpcHandlers(): void {
   // dialog — the popup's existing "no path yet" state already handles that.
   ipcMain.handle(
     'playback:getDefaultExportPath',
-    (_event, deviceId: string, channel: number, startMs: number): string | null => {
+    (_event, deviceId: string, channel: number, startMs: number, endMs: number): string | null => {
       const { exportPath } = readSettings();
       if (!exportPath) return null;
-      return join(exportPath, defaultExportFileName(deviceId, channel, startMs));
+      return join(exportPath, defaultExportFileName(deviceId, channel, startMs, endMs));
     },
   );
 
@@ -296,6 +322,21 @@ export function registerPlaybackIpcHandlers(): void {
   // cleanly instead of orphaned.
   ipcMain.handle('playback:stopBackup', async (_event, _deviceId: string, downloadHandle: string) => {
     await tracked(clipExporter.stopExport(downloadHandle));
+  });
+
+  // Same "stop should still work during quit" reasoning as stopBackup —
+  // pausing only tears down the native session, so it's just as safe to
+  // let run unguarded.
+  ipcMain.handle('playback:pauseBackup', async (_event, _deviceId: string, downloadHandle: string) => {
+    await tracked(clipExporter.pauseExport(downloadHandle));
+  });
+
+  // Guarded (unlike pause/stop above) since resuming opens a brand new
+  // native playback session — exactly the kind of new work assertNotQuitting
+  // exists to block once shutdown is underway.
+  ipcMain.handle('playback:resumeBackup', async (_event, _deviceId: string, downloadHandle: string) => {
+    assertNotQuitting();
+    await tracked(clipExporter.resumeExport(downloadHandle));
   });
 
   // Kept as a final trust-but-verify check even now that export goes

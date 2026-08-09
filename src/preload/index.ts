@@ -186,13 +186,13 @@ const playback = {
   // chooses the destination — playback:startBackup (below) is a separate,
   // later step so the UI can show the chosen path and a distinct
   // "Download" button before anything actually starts transferring.
-  chooseExportPath: (deviceId: string, channel: number, startMs: number): Promise<string | null> =>
-    ipcRenderer.invoke('playback:chooseExportPath', deviceId, channel, startMs),
+  chooseExportPath: (deviceId: string, channel: number, startMs: number, endMs: number): Promise<string | null> =>
+    ipcRenderer.invoke('playback:chooseExportPath', deviceId, channel, startMs, endMs),
 
   // Null when Settings' Video tab has no Export Path configured — the
   // popup falls back to requiring chooseExportPath (above) in that case.
-  getDefaultExportPath: (deviceId: string, channel: number, startMs: number): Promise<string | null> =>
-    ipcRenderer.invoke('playback:getDefaultExportPath', deviceId, channel, startMs),
+  getDefaultExportPath: (deviceId: string, channel: number, startMs: number, endMs: number): Promise<string | null> =>
+    ipcRenderer.invoke('playback:getDefaultExportPath', deviceId, channel, startMs, endMs),
 
   startBackup: (deviceId: string, channel: number, startMs: number, endMs: number, filePath: string): Promise<string> =>
     ipcRenderer.invoke('playback:startBackup', deviceId, channel, startMs, endMs, filePath),
@@ -202,6 +202,12 @@ const playback = {
 
   stopBackup: (deviceId: string, downloadHandle: string): Promise<void> =>
     ipcRenderer.invoke('playback:stopBackup', deviceId, downloadHandle),
+
+  pauseBackup: (deviceId: string, downloadHandle: string): Promise<void> =>
+    ipcRenderer.invoke('playback:pauseBackup', deviceId, downloadHandle),
+
+  resumeBackup: (deviceId: string, downloadHandle: string): Promise<void> =>
+    ipcRenderer.invoke('playback:resumeBackup', deviceId, downloadHandle),
 
   verifyExportedFile: (filePath: string): Promise<{ ok: boolean; size: number }> =>
     ipcRenderer.invoke('playback:verifyExportedFile', filePath),

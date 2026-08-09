@@ -35,6 +35,11 @@ const FFMPEG_EXIT_GRACE_MS = 3000;
 
 interface ExportJob {
   adapter: VmsAdapter;
+  // Kept so pauseExport/resumeExport can re-open a fresh native playback
+  // session later — startExport itself only ever needed these transiently
+  // before this.
+  sessionId: string;
+  channel: number;
   viewHandle: string | null;
   startMs: number;
   endMs: number;
@@ -50,11 +55,21 @@ interface ExportJob {
   // works regardless of whether a vendor's timestamps are epoch-absolute
   // or stream-relative, as long as they advance at real content speed.
   firstFrameContentMs: number | null;
+  // Furthest content timestamp actually written so far - resumeExport
+  // restarts native playback from just past this point rather than from
+  // startMs again, so resuming doesn't re-capture (and duplicate) content
+  // already in the file.
+  lastContentMs: number | null;
   formatChecked: boolean;
   inactivityTimer: ReturnType<typeof setTimeout> | null;
   queue: Buffer[];
   draining: boolean;
   finalizePromise: Promise<void> | null;
+  // Set by pauseExport, cleared by resumeExport. ffmpeg stays alive and
+  // open the whole time - only the native playback session is torn down
+  // and later re-opened, so the same output file just keeps growing
+  // rather than needing a second file stitched together afterward.
+  paused: boolean;
 }
 
 const jobs = new Map<string, ExportJob>();
@@ -125,6 +140,7 @@ function handleFrame(handle: string, job: ExportJob, frame: DecodedFrame): void 
   if (job.firstFrameContentMs === null) job.firstFrameContentMs = frame.timestampMs;
   const elapsedContentMs = frame.timestampMs - job.firstFrameContentMs;
   job.progress = clamp((elapsedContentMs / Math.max(1, job.endMs - job.startMs)) * 100, 0, 100);
+  job.lastContentMs = frame.timestampMs;
 
   if (!job.formatChecked) {
     job.formatChecked = true;
@@ -217,6 +233,8 @@ export async function startExport(
   const handle = randomUUID();
   const job: ExportJob = {
     adapter,
+    sessionId,
+    channel,
     viewHandle: null,
     startMs,
     endMs,
@@ -224,11 +242,13 @@ export async function startExport(
     ffmpeg: null,
     progress: 0,
     firstFrameContentMs: null,
+    lastContentMs: null,
     formatChecked: false,
     inactivityTimer: null,
     queue: [],
     draining: false,
     finalizePromise: null,
+    paused: false,
   };
   jobs.set(handle, job);
   armInactivityTimer(handle, job);
@@ -239,7 +259,7 @@ export async function startExport(
     // decode isn't paced to real time (no on-screen render forcing it to
     // wait) floods this callback fast enough to starve Electron's main
     // thread, which Windows then kills as "not responding."
-    job.viewHandle = await adapter.startPlayback(
+    const viewHandle = await adapter.startPlayback(
       sessionId,
       channel,
       startMs,
@@ -249,6 +269,15 @@ export async function startExport(
       },
       true,
     );
+    // pauseExport can run while this call was still in flight (Dahua's
+    // native connect is slow enough for a user to hit Pause within that
+    // window) - rather than let a paused job's session slip back in once
+    // this resolves, immediately stop what was just opened.
+    if (job.paused || job.finalizePromise) {
+      adapter.stopPlayback?.(viewHandle).catch(() => undefined);
+    } else {
+      job.viewHandle = viewHandle;
+    }
   } catch (err) {
     if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
     jobs.delete(handle);
@@ -267,6 +296,67 @@ export function getExportProgress(handle: string): number {
 
 export async function stopExport(handle: string): Promise<void> {
   await finalize(handle);
+}
+
+// Stops the underlying native playback session but leaves ffmpeg open and
+// the job registered — unlike stopExport/finalize, this is meant to be
+// resumed. The inactivity timer is cleared for the same reason it's
+// cleared during finalize: no frames arriving is expected and intentional
+// while paused, not a stall to detect.
+export async function pauseExport(handle: string): Promise<void> {
+  const job = jobs.get(handle);
+  if (!job || job.paused || job.finalizePromise) return;
+  job.paused = true;
+  if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
+  const viewHandle = job.viewHandle;
+  job.viewHandle = null;
+  if (viewHandle) {
+    try {
+      await job.adapter.stopPlayback?.(viewHandle);
+    } catch {
+      // best-effort — matches playback:stop's own tone elsewhere
+    }
+  }
+}
+
+// Re-opens a native playback session starting just past whatever was last
+// actually written (not from the original startMs again, which would
+// re-capture and duplicate already-exported content) and keeps feeding the
+// SAME still-open ffmpeg process.
+export async function resumeExport(handle: string): Promise<void> {
+  const job = jobs.get(handle);
+  if (!job || !job.paused || job.finalizePromise) return;
+  job.paused = false;
+  if (!job.adapter.startPlayback) return;
+  const resumeFromMs = job.lastContentMs !== null ? job.lastContentMs + 1 : job.startMs;
+  if (resumeFromMs >= job.endMs) {
+    finalize(handle).catch(() => undefined);
+    return;
+  }
+  armInactivityTimer(handle, job);
+  try {
+    const viewHandle = await job.adapter.startPlayback(
+      job.sessionId,
+      job.channel,
+      resumeFromMs,
+      job.endMs,
+      (frame) => {
+        handleFrame(handle, job, frame);
+      },
+      true,
+    );
+    // Re-paused (or cancelled) again while this connect was in flight.
+    if (job.paused || job.finalizePromise) {
+      job.adapter.stopPlayback?.(viewHandle).catch(() => undefined);
+    } else {
+      job.viewHandle = viewHandle;
+    }
+  } catch {
+    // Leave it paused rather than silently finalizing - the renderer's
+    // Resume button is still there for the user to try again.
+    job.paused = true;
+    if (job.inactivityTimer) clearTimeout(job.inactivityTimer);
+  }
 }
 
 // Finalizes every still-active export in parallel — wired into app quit

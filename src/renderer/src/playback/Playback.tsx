@@ -138,6 +138,11 @@ interface DownloadItem {
   path: string;
   progress: number;
   done: boolean;
+  // User-paused via the Downloads popup's own Pause button — distinct from
+  // done/error, and from a tile's on-screen setFrameDelivery pause (that's
+  // about not rendering a preview nobody's looking at; this actually stops
+  // and later resumes the export's own native session).
+  paused: boolean;
   // Set once the file's actually been checked on disk after reaching
   // 100% — a vendor reporting "done" doesn't necessarily mean the
   // transfer genuinely succeeded (confirmed live on TVT: a failed
@@ -381,11 +386,12 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
   // Polls every download that isn't finished yet — runs independently of
   // whether the export popup is even open, since downloads keep going in
-  // the background after it closes.
+  // the background after it closes. Skips paused ones too - their progress
+  // is frozen server-side until Resume, so there's nothing new to poll for.
   useEffect(() => {
     const interval = setInterval(() => {
       setDownloads((prev) => {
-        const active = prev.filter((d) => !d.done);
+        const active = prev.filter((d) => !d.done && !d.paused);
         if (active.length === 0) return prev;
         active.forEach((d) => {
           window.ssmVms.playback.getBackupProgress(d.deviceId, d.handle).then((pct) => {
@@ -722,7 +728,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     // — "Change Destination…" in the popup still opens a real Save dialog
     // to override for this one clip. Null (no setting configured) just
     // leaves the popup in its original "choose a destination" state.
-    window.ssmVms.playback.getDefaultExportPath(deviceId, channel, startMs).then((path) => {
+    window.ssmVms.playback.getDefaultExportPath(deviceId, channel, startMs, endMs).then((path) => {
       if (!path) return;
       setExportPopup((prev) =>
         prev && prev.deviceId === deviceId && prev.channel === channel && prev.startMs === startMs
@@ -750,7 +756,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
       path: null,
       choosing: false,
     });
-    window.ssmVms.playback.getDefaultExportPath(deviceId, channel, seg.startMs).then((path) => {
+    window.ssmVms.playback.getDefaultExportPath(deviceId, channel, seg.startMs, seg.endMs).then((path) => {
       if (!path) return;
       setExportPopup((prev) =>
         prev && prev.deviceId === deviceId && prev.channel === channel && prev.startMs === seg.startMs
@@ -763,7 +769,12 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   async function handleChooseExportPath(): Promise<void> {
     if (!exportPopup) return;
     setExportPopup({ ...exportPopup, choosing: true });
-    const path = await window.ssmVms.playback.chooseExportPath(exportPopup.deviceId, exportPopup.channel, exportPopup.startMs);
+    const path = await window.ssmVms.playback.chooseExportPath(
+      exportPopup.deviceId,
+      exportPopup.channel,
+      exportPopup.startMs,
+      exportPopup.endMs,
+    );
     setExportPopup((prev) => (prev ? { ...prev, path, choosing: false } : prev));
   }
 
@@ -778,11 +789,15 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     setExportPopup(null);
     try {
       const handle = await window.ssmVms.playback.startBackup(deviceId, channel, startMs, endMs, path);
-      setDownloads((prev) => [...prev, { handle, deviceId, deviceName, channel, channelLabel, path, progress: 0, done: false }]);
+      setDownloads((prev) => [
+        ...prev,
+        { handle, deviceId, deviceName, channel, channelLabel, path, progress: 0, done: false, paused: false },
+      ]);
     } catch (err) {
-      // Export is currently disabled server-side (see main/ipc/playback.ts)
-      // — surfaced here in the same Downloads list as a real transfer's
-      // failure would be, rather than the click silently doing nothing.
+      // A real startBackup failure (e.g. ONVIF's "not supported" error, or
+      // a connection drop) — surfaced here in the same Downloads list a
+      // transfer's own failure would be, rather than the click silently
+      // doing nothing.
       setDownloads((prev) => [
         ...prev,
         {
@@ -794,6 +809,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           path,
           progress: 0,
           done: true,
+          paused: false,
           error: err instanceof Error ? err.message : String(err),
         },
       ]);
@@ -809,6 +825,20 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     if (!item) return;
     await window.ssmVms.playback.stopBackup(item.deviceId, handle).catch(() => undefined);
     setDownloads((prev) => prev.filter((d) => d.handle !== handle));
+  }
+
+  async function handlePauseDownload(handle: string): Promise<void> {
+    const item = downloads.find((d) => d.handle === handle);
+    if (!item) return;
+    setDownloads((prev) => prev.map((d) => (d.handle === handle ? { ...d, paused: true } : d)));
+    await window.ssmVms.playback.pauseBackup(item.deviceId, handle).catch(() => undefined);
+  }
+
+  async function handleResumeDownload(handle: string): Promise<void> {
+    const item = downloads.find((d) => d.handle === handle);
+    if (!item) return;
+    setDownloads((prev) => prev.map((d) => (d.handle === handle ? { ...d, paused: false } : d)));
+    await window.ssmVms.playback.resumeBackup(item.deviceId, handle).catch(() => undefined);
   }
 
   function handleDismissDownload(handle: string): void {
@@ -1240,7 +1270,15 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
               {downloads.length > 0 &&
                 (() => {
-                  const avgProgress = downloads.reduce((sum, d) => sum + d.progress, 0) / downloads.length;
+                  // Only the downloads still actually in flight — averaging
+                  // in ones that already finished (sitting at 100%) or
+                  // failed (sitting at 0%) was reporting a number that
+                  // didn't match the transfer actually happening right now.
+                  const activeDownloads = downloads.filter((d) => !d.done);
+                  const avgProgress =
+                    activeDownloads.length > 0
+                      ? activeDownloads.reduce((sum, d) => sum + d.progress, 0) / activeDownloads.length
+                      : 100;
                   return (
                     <button
                       onClick={() => setDownloadsPopupOpen(true)}
@@ -1461,7 +1499,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                       style={{
                         width: `${d.progress}%`,
                         height: '100%',
-                        background: d.error ? theme.danger : d.done ? theme.success : theme.accent,
+                        background: d.error ? theme.danger : d.done ? theme.success : d.paused ? theme.warning : theme.accent,
                         transition: 'width 0.2s',
                       }}
                     />
@@ -1470,6 +1508,9 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                     {Math.round(d.progress)}%
                   </span>
                 </div>
+                {d.paused && !d.error && (
+                  <div style={{ fontSize: '11px', color: theme.warning }}>Paused</div>
+                )}
                 {d.error && <div style={{ fontSize: '11px', color: theme.danger }}>{d.error}</div>}
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   <button onClick={() => handleOpenDownloadLocation(d.path)} style={secondaryButtonStyle}>
@@ -1480,9 +1521,20 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                       Dismiss
                     </button>
                   ) : (
-                    <button onClick={() => handleStopDownload(d.handle)} style={secondaryButtonStyle}>
-                      Cancel
-                    </button>
+                    <>
+                      {d.paused ? (
+                        <button onClick={() => handleResumeDownload(d.handle)} style={secondaryButtonStyle}>
+                          Resume
+                        </button>
+                      ) : (
+                        <button onClick={() => handlePauseDownload(d.handle)} style={secondaryButtonStyle}>
+                          Pause
+                        </button>
+                      )}
+                      <button onClick={() => handleStopDownload(d.handle)} style={secondaryButtonStyle}>
+                        Cancel
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
