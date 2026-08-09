@@ -1668,6 +1668,8 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           {fileListEntries.map((seg, i) => (
             <div
               key={i}
+              onClick={() => playTileFrom(selectedTileIndex, seg.startMs, seg.endMs)}
+              title="Click to play this recording"
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -1676,7 +1678,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                 padding: '0.4rem 0.5rem',
                 borderRadius: '4px',
                 border: `1px solid ${theme.border}`,
+                cursor: 'pointer',
               }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = theme.accentFaint)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', overflow: 'hidden' }}>
                 <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: TYPE_COLOR[seg.type], flexShrink: 0 }} />
@@ -1685,7 +1690,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
                 </span>
               </div>
               <button
-                onClick={() => handleDownloadSegment(seg)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDownloadSegment(seg);
+                }}
                 title="Download this recording"
                 style={{
                   background: 'none',
