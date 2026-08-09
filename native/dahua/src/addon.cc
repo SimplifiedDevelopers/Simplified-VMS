@@ -609,8 +609,6 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
-    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lLoginID_));
-
     const bool wantAll = filters_.empty() || std::find(filters_.begin(), filters_.end(), "all") != filters_.end();
     const bool wantContinuous =
         wantAll || std::find(filters_.begin(), filters_.end(), "continuous") != filters_.end();
@@ -629,6 +627,24 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
     // query from the latest file's own end time and keep going until a
     // call returns nothing more or the requested range is exhausted.
     // kMaxIterations is just a runaway-loop guard, not an expected ceiling.
+    //
+    // The per-device SdkMutexForSession lock is acquired per-iteration here
+    // (just around the one CLIENT_QueryRecordFile call), not once for the
+    // whole loop - confirmed live as a real bug otherwise: MiniCalendar
+    // fires a background month-wide search (quick=true) on every date/
+    // device/channel change to populate its recording-day dots, but Dahua's
+    // adapter ignores the quick flag entirely (dahua.ts's findRecordings
+    // ignores its trailing _quick param, unlike Uniview's own quick-path),
+    // so that background scan runs this exact same paginated loop over a
+    // whole month instead of a day. Holding the lock for the entire loop
+    // meant that background scan could monopolize the device's ONE shared
+    // SDK lock for minutes, forcing an explicit Play/Download click for the
+    // same device to queue up behind it the whole time - confirmed live as
+    // the cause of a reported 2-3 minute delay starting playback/downloads
+    // that lined up exactly with this background scan still running.
+    // Releasing the lock between iterations lets a higher-priority call
+    // (Play/Stop/another FindRecordings) interleave in the gap instead of
+    // waiting for the whole multi-minute scan to finish first.
     auto queryPaged = [&](int recordFileType, const char* label) {
       int64_t cursorMs = beginMs_;
       const int kMaxIterations = 2000;
@@ -636,9 +652,13 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
         NET_TIME begin = EpochMsToNetTime(cursorMs);
         NET_TIME end = EpochMsToNetTime(endMs_);
         int fileCount = 0;
-        const BOOL ok = CLIENT_QueryRecordFile(lLoginID_, channel_, recordFileType, &begin, &end, nullptr,
-                                                buffer.data(), static_cast<int>(buffer.size()), &fileCount, 5000,
-                                                FALSE);
+        BOOL ok;
+        {
+          std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lLoginID_));
+          ok = CLIENT_QueryRecordFile(lLoginID_, channel_, recordFileType, &begin, &end, nullptr,
+                                      buffer.data(), static_cast<int>(buffer.size()), &fileCount, 5000,
+                                      FALSE);
+        }
         if (!ok || fileCount <= 0) break;
 
         int64_t maxEndMs = cursorMs;

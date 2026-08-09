@@ -715,6 +715,11 @@ std::vector<std::pair<INT64, INT64>> SearchByFile(LPVOID lUserID, int channel, I
   findCond.tEndTime = endTime;
   findCond.dwFileType = static_cast<INT32>(fileSearchType);
 
+  // Locked here (per call) rather than once around the whole FindRecordings
+  // Execute() - see SearchByFileChunked's matching comment for why holding
+  // this device-wide lock for an entire multi-search/multi-day scan was a
+  // real, confirmed-live bug.
+  std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
   LPVOID findHandle = NETDEV_FindFile_V30(lUserID, &findCond);
   if (!findHandle) return out;  // no matches - not an error
 
@@ -738,14 +743,24 @@ std::vector<std::pair<INT64, INT64>> SearchByFile(LPVOID lUserID, int channel, I
 // week-sized chunks (fully enumerated) still silently dropped whole days on
 // a sufficiently busy channel, and a "slow-null means it was actually a
 // timeout, so bisect" heuristic on top of that still didn't fully recover
-// them. Correctness matters more than speed here, since this quick search
-// is now only ever run in the background via a per-Uniview-device prefetch
-// (connectionManager.ts, gated to vendor==='uniview') and cached
-// (recordingCalendarCache.ts) rather than blocking the calendar's own
-// render - so it's fine for this to take the full ~30 seconds for a busy
-// channel's month, same as one query per calendar day, since nothing is
-// waiting on it synchronously. Early-exiting each day's enumeration after
-// the first match keeps it a genuine "yes/no per day" probe rather than
+// them. Correctness matters more than speed here.
+//
+// NOTE: the "nothing is waiting on it synchronously" reasoning this comment
+// used to end on is now WRONG and left here as a warning, not a rationale -
+// it assumed the connectionManager.ts per-device prefetch (mentioned above)
+// that used to warm this cache in the background right after connect, well
+// before a user ever opened the calendar. That prefetch was reverted (see
+// connectionManager.ts's loginOnce) once it was confirmed to compete for
+// this exact device-wide lock against ordinary Live View channel starts.
+// What actually calls this today is MiniCalendar's own month-wide query,
+// fired live whenever a device/channel/date is picked in Playback - and
+// held the device's ONE shared SdkMutexForSession lock for this entire
+// multi-day loop (confirmed live: a user's explicit Play/Download click on
+// the very next line would queue up behind however long this scan took,
+// sometimes minutes). Locking is now scoped per-day inside the loop below
+// instead, so a foreground call can interleave between days rather than
+// wait for the whole month. Early-exiting each day's enumeration after the
+// first match still keeps this a genuine "yes/no per day" probe rather than
 // wastefully collecting every segment, which the calendar dots don't need.
 std::vector<std::pair<INT64, INT64>> SearchByFileChunked(LPVOID lUserID, int channel, INT64 beginTime, INT64 endTime,
                                                           UINT32 fileSearchType) {
@@ -762,6 +777,7 @@ std::vector<std::pair<INT64, INT64>> SearchByFileChunked(LPVOID lUserID, int cha
     findCond.tEndTime = dayEnd;
     findCond.dwFileType = static_cast<INT32>(fileSearchType);
 
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
     LPVOID findHandle = NETDEV_FindFile_V30(lUserID, &findCond);
     if (!findHandle) continue;  // no match this day, or this one day timed out - move on regardless
 
@@ -791,6 +807,9 @@ std::vector<std::pair<INT64, INT64>> SearchByEvent(LPVOID lUserID, UINT32 channe
   param.udwLimit = 2000;
   param.udwPage = 0;
 
+  // Locked here (per call), not once around the whole FindRecordings
+  // Execute() - see SearchByFileChunked's matching comment.
+  std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID));
   NETDEV_BATCH_OPERATE_BASIC_S resultInfo = {};
   LPVOID findHandle = NETDEV_FindEventRecordList(lUserID, &param, &resultInfo);
   if (!findHandle) {
@@ -840,8 +859,14 @@ class FindRecordingsWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
-    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
-
+    // No longer locked here for the whole call - SearchByFile/
+    // SearchByFileChunked/SearchByEvent below each take the device's
+    // SdkMutexForSession themselves, scoped to their own individual native
+    // call(s), so a multi-day/multi-search scan here can't monopolize the
+    // device's one shared lock against a foreground Play/Download click for
+    // however long the whole thing takes. See SearchByFileChunked's comment
+    // for the confirmed-live symptom this fixed.
+    //
     // continuous is a FILE-level search (wide chunk boundaries, e.g. a
     // whole hour-long file) while motion/smart are EVENT-level (the
     // precise, much narrower detection window, typically nested INSIDE a
