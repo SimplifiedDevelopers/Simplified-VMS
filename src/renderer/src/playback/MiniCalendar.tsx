@@ -179,7 +179,7 @@ export function MiniCalendar({ selectedDate, onSelect, deviceId, channel, filter
                     width: '3px',
                     height: '3px',
                     borderRadius: '50%',
-                    background: isSelected ? theme.accentText : theme.accent,
+                    background: isSelected ? theme.accentText : theme.text,
                   }}
                 />
               )}
