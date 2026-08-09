@@ -156,6 +156,19 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   const [tiles, setTiles] = useState<PlaybackTileState[]>(() => Array.from({ length: MAX_TILES }, emptyTile));
   const tilesRef = useRef(tiles);
   tilesRef.current = tiles;
+  // Guards playTileFrom against overlapping invocations for the SAME tile
+  // — confirmed live as a real bug: a slow vendor's stop()/start() (Dahua,
+  // whose native stop/start calls can take a long time) leaves a wide
+  // window where an impatient extra click re-enters playTileFrom before
+  // the first call's stop+start has resolved and updated tile.viewHandle,
+  // so the second call reads the same stale handle, redundantly stops it,
+  // and starts its OWN new session — repeat that a few times and native
+  // playback sessions pile up concurrently (confirmed live: 7 simultaneous
+  // 1080p decodes for one Dahua channel from a handful of clicks), pegging
+  // CPU well beyond what a single session would. A fast vendor's stop/
+  // start calls close this window quickly enough that it's very hard to
+  // hit; Dahua's slowness makes it easy.
+  const tileTransitionsRef = useRef<Set<number>>(new Set());
   const [selectedTileIndex, setSelectedTileIndex] = useState(0);
   // Same expand/restore behavior as Live View's grid: double-click a
   // filled tile to have it fill the whole grid, double-click again to go
@@ -528,36 +541,48 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   }, [date, filters]);
 
   async function playTileFrom(index: number, startMs: number, endMs: number): Promise<void> {
-    const tile = tilesRef.current[index];
-    if (!tile.deviceId || tile.channel === null) return;
-    const sameSegmentAlreadyOpen =
-      tile.viewHandle !== null && tile.playStartMs !== null && tile.playEndMs !== null &&
-      startMs >= tile.playStartMs && startMs <= tile.playEndMs;
+    // See tileTransitionsRef's own doc comment - ignore a re-entrant call
+    // for this same tile rather than letting it race the one already in
+    // flight (which would each read the same stale viewHandle and start
+    // their own redundant session). The user's click isn't lost forever —
+    // once the in-flight transition finishes and updates state, a repeat
+    // click lands cleanly against the new, correct viewHandle.
+    if (tileTransitionsRef.current.has(index)) return;
+    tileTransitionsRef.current.add(index);
     try {
-      if (sameSegmentAlreadyOpen) {
-        await window.ssmVms.playback.control(tile.deviceId, tile.viewHandle!, 'seek', startMs);
-        updateTile(index, { isPaused: false, currentMs: startMs });
-        return;
+      const tile = tilesRef.current[index];
+      if (!tile.deviceId || tile.channel === null) return;
+      const sameSegmentAlreadyOpen =
+        tile.viewHandle !== null && tile.playStartMs !== null && tile.playEndMs !== null &&
+        startMs >= tile.playStartMs && startMs <= tile.playEndMs;
+      try {
+        if (sameSegmentAlreadyOpen) {
+          await window.ssmVms.playback.control(tile.deviceId, tile.viewHandle!, 'seek', startMs);
+          updateTile(index, { isPaused: false, currentMs: startMs });
+          return;
+        }
+        if (tile.viewHandle) await window.ssmVms.playback.stop(tile.deviceId, tile.viewHandle);
+        const handle = await window.ssmVms.playback.start(tile.deviceId, tile.channel, startMs, endMs);
+        updateTile(index, {
+          viewHandle: handle,
+          isPaused: false,
+          currentMs: startMs,
+          playStartMs: startMs,
+          playEndMs: endMs,
+          error: null,
+        });
+      } catch (err) {
+        updateTile(index, {
+          viewHandle: null,
+          isPaused: false,
+          currentMs: null,
+          playStartMs: null,
+          playEndMs: null,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      if (tile.viewHandle) await window.ssmVms.playback.stop(tile.deviceId, tile.viewHandle);
-      const handle = await window.ssmVms.playback.start(tile.deviceId, tile.channel, startMs, endMs);
-      updateTile(index, {
-        viewHandle: handle,
-        isPaused: false,
-        currentMs: startMs,
-        playStartMs: startMs,
-        playEndMs: endMs,
-        error: null,
-      });
-    } catch (err) {
-      updateTile(index, {
-        viewHandle: null,
-        isPaused: false,
-        currentMs: null,
-        playStartMs: null,
-        playEndMs: null,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    } finally {
+      tileTransitionsRef.current.delete(index);
     }
   }
 

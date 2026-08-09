@@ -150,7 +150,9 @@ void CALLBACK OnDecodedFrame(LLONG /*lLoginID*/, LLONG lPlayHandle, NET_FRAME_DE
   // before doing any of the expensive conversion/dispatch work below,
   // rather than trying to throttle after the fact on the JS side (by the
   // time a frame reaches JS, the CPU/memory-bandwidth cost of decoding and
-  // converting it has already been paid).
+  // converting it has already been paid). Confirmed live: Dahua's nStamp
+  // is already real milliseconds (~33ms/frame, 30fps) unlike Uniview's
+  // tRenderTime - no unit conversion needed here.
   if (session->paceToRealtime) {
     if (!session->paceInitialized) {
       session->paceInitialized = true;
