@@ -89,6 +89,14 @@ interface PlaybackTileState {
   playStartMs: number | null;
   playEndMs: number | null;
   error: string | null;
+  // Set by handleStopAll right before it clears currentMs/playEndMs below
+  // - lets the Resume button (next to Stop) restart playback from the
+  // exact point it was stopped at, instead of the user needing to re-find
+  // and re-click that spot on the timeline. null whenever there's nothing
+  // to resume (never played, or already resumed/replaced by a new
+  // segment - both paths reset the tile via emptyTile()).
+  stoppedAtMs: number | null;
+  stoppedEndMs: number | null;
 }
 
 function emptyTile(): PlaybackTileState {
@@ -105,6 +113,8 @@ function emptyTile(): PlaybackTileState {
     playStartMs: null,
     playEndMs: null,
     error: null,
+    stoppedAtMs: null,
+    stoppedEndMs: null,
   };
 }
 
@@ -159,7 +169,7 @@ interface DownloadItem {
 // different one while staying mounted.
 export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   const [devices, setDevices] = useState<StoredDevice[]>([]);
-  const [layout, setLayout] = useState<(typeof LAYOUTS)[number]>(4);
+  const [layout, setLayout] = useState<(typeof LAYOUTS)[number]>(1);
   const [tiles, setTiles] = useState<PlaybackTileState[]>(() => Array.from({ length: MAX_TILES }, emptyTile));
   const tilesRef = useRef(tiles);
   tilesRef.current = tiles;
@@ -396,9 +406,20 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
         // stopTile also prunes this viewHandle out of videoHealthByHandle —
         // reused here (instead of calling window.ssmVms.playback.stop
         // directly) so that cleanup applies on this path too, not just the
-        // explicit close/reassign/research ones.
+        // explicit close/reassign/research ones. Remembers the position via
+        // stoppedAtMs/stoppedEndMs, same as the explicit Stop button, so the
+        // Resume button can pick up exactly where the export interrupted
+        // this tile rather than the user needing to re-find that spot.
         stopTile(index);
-        updateTile(index, { viewHandle: null, isPaused: false, currentMs: null, playStartMs: null, playEndMs: null });
+        updateTile(index, {
+          viewHandle: null,
+          isPaused: false,
+          currentMs: null,
+          playStartMs: null,
+          playEndMs: null,
+          stoppedAtMs: tile.currentMs,
+          stoppedEndMs: tile.playEndMs,
+        });
         return;
       }
       const shouldDeliver = isActive && (expandedTileIndex === null || expandedTileIndex === index);
@@ -726,7 +747,19 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
       tilesRef.current.map(async (t, i) => {
         if (t.deviceId && t.channel !== null) {
           await stopTile(i);
-          updateTile(i, { viewHandle: null, isPaused: false, currentMs: null, playStartMs: null, playEndMs: null });
+          // stoppedAtMs/stoppedEndMs explicitly cleared here (unlike the
+          // export-triggered stop above) - a date/filter change means any
+          // remembered position is for a different day's context, wrong to
+          // resume into.
+          updateTile(i, {
+            viewHandle: null,
+            isPaused: false,
+            currentMs: null,
+            playStartMs: null,
+            playEndMs: null,
+            stoppedAtMs: null,
+            stoppedEndMs: null,
+          });
           await searchTile(i, t.deviceId, t.channel);
         }
       }),
@@ -756,7 +789,13 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
       try {
         if (sameSegmentAlreadyOpen) {
           await window.ssmVms.playback.control(tile.deviceId, tile.viewHandle!, 'seek', startMs);
-          updateTile(index, { isPaused: false, currentMs: startMs });
+          // stoppedAtMs/stoppedEndMs cleared on every play action (not just
+          // an explicit Resume click) - confirmed live as a real gap
+          // otherwise: stop, then click a totally different segment, and
+          // the Resume button stayed enabled pointing at the now-unrelated
+          // old stop position instead of reflecting what's actually
+          // playing.
+          updateTile(index, { isPaused: false, currentMs: startMs, stoppedAtMs: null, stoppedEndMs: null });
           return;
         }
         if (tile.viewHandle) await window.ssmVms.playback.stop(tile.deviceId, tile.viewHandle);
@@ -768,6 +807,8 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           playStartMs: startMs,
           playEndMs: endMs,
           error: null,
+          stoppedAtMs: null,
+          stoppedEndMs: null,
         });
       } catch (err) {
         updateTile(index, {
@@ -776,6 +817,8 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           currentMs: null,
           playStartMs: null,
           playEndMs: null,
+          stoppedAtMs: null,
+          stoppedEndMs: null,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -808,6 +851,13 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     return tiles.map((_, i) => i).filter((i) => i < layout && tiles[i].viewHandle);
   }
 
+  // Tiles with a remembered stop position (see PlaybackTileState's
+  // stoppedAtMs doc comment) - distinct from activeTileIndices, since a
+  // stopped tile's viewHandle is null by definition.
+  function resumableTileIndices(): number[] {
+    return tiles.map((_, i) => i).filter((i) => i < layout && tiles[i].stoppedAtMs !== null);
+  }
+
   async function handlePlayPause(): Promise<void> {
     const goingToPause = !selectedTile.isPaused;
     const command = goingToPause ? 'pause' : 'resume';
@@ -828,8 +878,39 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   async function handleStopAll(): Promise<void> {
     await Promise.all(
       activeTileIndices().map(async (i) => {
+        const t = tilesRef.current[i];
+        const stoppedAtMs = t.currentMs;
+        const stoppedEndMs = t.playEndMs;
         await stopTile(i);
-        updateTile(i, { viewHandle: null, isPaused: false, currentMs: null, playStartMs: null, playEndMs: null });
+        updateTile(i, {
+          viewHandle: null,
+          isPaused: false,
+          currentMs: null,
+          playStartMs: null,
+          playEndMs: null,
+          stoppedAtMs,
+          stoppedEndMs,
+        });
+      }),
+    );
+  }
+
+  // Resumes every stopped-but-resumable tile from the exact point it was
+  // stopped at (see PlaybackTileState's stoppedAtMs doc comment), rather
+  // than requiring the user to re-find and re-click that spot on the
+  // timeline. Clears stoppedAtMs/stoppedEndMs via playTileFrom's own
+  // updateTile call (playStartMs/playEndMs get set to the same values,
+  // making the old stoppedAtMs/stoppedEndMs redundant - explicitly cleared
+  // here too so a later Stop can't ever see a stale pair from two segments
+  // ago if something in between skipped updating them).
+  async function handleResumeFromStop(): Promise<void> {
+    // stoppedAtMs/stoppedEndMs get cleared inside playTileFrom itself once
+    // the new session actually starts, not here.
+    await Promise.all(
+      resumableTileIndices().map((i) => {
+        const t = tilesRef.current[i];
+        if (t.stoppedAtMs === null || t.stoppedEndMs === null) return Promise.resolve();
+        return playTileFrom(i, t.stoppedAtMs, t.stoppedEndMs);
       }),
     );
   }
@@ -1519,6 +1600,13 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             </TransportButton>
             <TransportButton title="Stop" disabled={!selectedTile.viewHandle} onClick={handleStopAll}>
               <StopIcon />
+            </TransportButton>
+            <TransportButton
+              title="Resume from where it was stopped"
+              disabled={selectedTile.stoppedAtMs === null}
+              onClick={handleResumeFromStop}
+            >
+              <PlayIcon />
             </TransportButton>
             <TransportButton title={`Speed: ${speed}x (click to cycle 1x → 2x → 4x → 8x)`} disabled={!selectedTile.viewHandle} onClick={handleSpeedCycle}>
               {speed}x
