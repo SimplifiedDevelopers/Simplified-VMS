@@ -827,8 +827,10 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
 // device.
 class ControlPlaybackWorker : public Napi::AsyncWorker {
  public:
-  ControlPlaybackWorker(Napi::Env env, LLONG lPlayHandle, std::string command, NET_TIME seekTime, double speed)
+  ControlPlaybackWorker(Napi::Env env, LLONG lLoginID, LLONG lPlayHandle, std::string command, NET_TIME seekTime,
+                         double speed)
       : Napi::AsyncWorker(env),
+        lLoginID_(lLoginID),
         lPlayHandle_(lPlayHandle),
         command_(std::move(command)),
         seekTime_(seekTime),
@@ -836,6 +838,14 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
+    // Every other native call for this device (StartLiveView/StartPlayback
+    // and their stops, FindRecordings) acquires this same per-device lock -
+    // this one was the exception, running fully unsynchronized against
+    // whatever else touches this device's SDK session concurrently (most
+    // notably the decode callback thread). Confirmed on TVT (the identical
+    // gap there) as the cause of an app crash when changing playback speed
+    // - applied here too before it gets a chance to surface the same way.
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lLoginID_));
     BOOL ok = FALSE;
     if (command_ == "pause") {
       ok = CLIENT_PausePlayBack(lPlayHandle_, TRUE);
@@ -844,8 +854,10 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
     } else if (command_ == "seek") {
       ok = CLIENT_SeekPlayBackByTime(lPlayHandle_, &seekTime_);
     } else if (command_ == "setSpeed") {
-      // Unlike TVT, Dahua's SDK gives a real explicit multiplier here - no
-      // step-cycling workaround needed.
+      // Unlike TVT/Hikvision, Dahua's SDK gives a real explicit multiplier
+      // here - no step-cycling workaround needed. Confirmed working live
+      // (smooth speed increase, not the keyframe-skip behavior seen on
+      // Hikvision) at 2x/4x/8x.
       ok = CLIENT_SetPlayBackSpeedEx(lPlayHandle_, speed_);
     } else if (command_ == "stepFrame") {
       // bStop=FALSE assumed to mean "advance one frame" (vs. TRUE stopping
@@ -864,6 +876,7 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise GetPromise() { return deferred_.Promise(); }
 
  private:
+  LLONG lLoginID_;
   LLONG lPlayHandle_;
   std::string command_;
   NET_TIME seekTime_;
@@ -883,7 +896,14 @@ Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
     speed = static_cast<double>(info[2].As<Napi::Number>().Int32Value());
   }
 
-  auto* worker = new ControlPlaybackWorker(env, lPlayHandle, command, seekTime, speed);
+  LLONG lLoginID = -1;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_sessionsByHandle.find(lPlayHandle);
+    if (it != g_sessionsByHandle.end()) lLoginID = it->second->lLoginID;
+  }
+
+  auto* worker = new ControlPlaybackWorker(env, lLoginID, lPlayHandle, command, seekTime, speed);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;

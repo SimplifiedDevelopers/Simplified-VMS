@@ -5,7 +5,7 @@ import { DigitalZoomLayer } from '../liveView/DigitalZoom';
 import { TileContextMenu } from '../liveView/TileContextMenu';
 import { MiniCalendar } from './MiniCalendar';
 import { Modal } from '../components/Modal';
-import { CameraOffIcon } from '../components/icons';
+import { CameraOffIcon, PanelChevronIcon } from '../components/icons';
 import emptyTileCamera from '../assets/empty-tile-camera.png';
 import type {
   ChannelInfo,
@@ -541,6 +541,14 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   async function stopTile(index: number): Promise<void> {
     const tile = tilesRef.current[index];
     if (!tile.deviceId || !tile.viewHandle) return;
+    // Confirmed live: fast-forward speed persisted across a stop/close/
+    // channel switch, so the NEXT thing played silently inherited whatever
+    // multiplier was left over from the last one. speed is a single value
+    // shared across all tiles (handleSpeedCycle applies it to every active
+    // tile at once), so resetting it here - the one chokepoint every stop/
+    // close/reassign already funnels through - covers all three reported
+    // cases without needing a per-tile speed field.
+    setSpeed(1);
     // videoHealthByHandle otherwise keeps every viewHandle this tab has
     // ever played, forever — confirmed live as unbounded, real growth over
     // a long session with many channel switches, each getting its own
@@ -846,12 +854,61 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
   }
 
   async function handleSpeedCycle(): Promise<void> {
-    const next: PlaybackSpeed = speed === 1 ? 2 : speed === 2 ? 4 : 1;
+    const next: PlaybackSpeed = speed === 1 ? 2 : speed === 2 ? 4 : speed === 4 ? 8 : 1;
     setSpeed(next);
     await Promise.all(
-      activeTileIndices().map((i) => {
+      activeTileIndices().map(async (i) => {
         const t = tilesRef.current[i];
-        return window.ssmVms.playback.control(t.deviceId!, t.viewHandle!, 'setSpeed', next).catch(() => undefined);
+        // TVT's native SDK crashes the whole app when its own "reset to
+        // normal speed" call is made on a session that's currently
+        // accelerated - confirmed live (twice) via Windows Event Viewer
+        // showing a divide-by-zero INSIDE the vendor's own DLL, not our
+        // code. There's no safe way found to call that reset once
+        // accelerated, so returning to 1x sidesteps it entirely for TVT by
+        // restarting the playback session fresh at the current position -
+        // a brand-new session always starts at 1x, no reset call needed.
+        // Deliberately does NOT go through playTileFrom: its own "same
+        // segment already open" shortcut would just seek the EXISTING
+        // still-accelerated session instead of truly restarting it (since
+        // resuming at the current position within the same segment matches
+        // that shortcut's condition exactly - confirmed live as why the
+        // first version of this fix still crashed), and even clearing
+        // viewHandle via updateTile first can't reliably prevent that
+        // here - updateTile's setTiles is async, so tilesRef.current isn't
+        // guaranteed to reflect the clear yet by the time playTileFrom
+        // would read it a line later, with no await in between to let
+        // React's render actually catch up. Calling start()/updateTile
+        // directly, like playTileFrom's own "fresh start" branch does,
+        // sidesteps that race entirely.
+        const device = devices.find((d) => d.id === t.deviceId);
+        if (next === 1 && device?.vendor === 'tvt' && t.currentMs !== null && t.playEndMs !== null &&
+            t.deviceId && t.channel !== null) {
+          const resumeMs = t.currentMs;
+          const resumeEndMs = t.playEndMs;
+          await stopTile(i);
+          try {
+            const handle = await window.ssmVms.playback.start(t.deviceId, t.channel, resumeMs, resumeEndMs);
+            updateTile(i, {
+              viewHandle: handle,
+              isPaused: false,
+              currentMs: resumeMs,
+              playStartMs: resumeMs,
+              playEndMs: resumeEndMs,
+              error: null,
+            });
+          } catch (err) {
+            updateTile(i, {
+              viewHandle: null,
+              isPaused: false,
+              currentMs: null,
+              playStartMs: null,
+              playEndMs: null,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          return;
+        }
+        await window.ssmVms.playback.control(t.deviceId!, t.viewHandle!, 'setSpeed', next).catch(() => undefined);
       }),
     );
   }
@@ -1463,7 +1520,7 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             <TransportButton title="Stop" disabled={!selectedTile.viewHandle} onClick={handleStopAll}>
               <StopIcon />
             </TransportButton>
-            <TransportButton title={`Speed: ${speed}x (click to cycle 1x → 2x → 4x)`} disabled={!selectedTile.viewHandle} onClick={handleSpeedCycle}>
+            <TransportButton title={`Speed: ${speed}x (click to cycle 1x → 2x → 4x → 8x)`} disabled={!selectedTile.viewHandle} onClick={handleSpeedCycle}>
               {speed}x
             </TransportButton>
             <TransportButton title="Sync playback position across cameras" disabled={activeTileIndices().length < 2} onClick={handleSync}>
@@ -1580,10 +1637,10 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           manually first. */}
       <div
         style={{
-          width: fileListCollapsed ? '26px' : '220px',
+          width: fileListCollapsed ? '34px' : '220px',
           flexShrink: 0,
           borderLeft: `1px solid ${theme.border}`,
-          padding: fileListCollapsed ? '0.75rem 0.25rem' : '0.75rem',
+          padding: fileListCollapsed ? '0.5rem 0.25rem' : '0.75rem',
           display: 'flex',
           flexDirection: 'column',
           gap: '0.6rem',
@@ -1594,21 +1651,28 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             onClick={() => setFileListCollapsed(false)}
             title="Expand recording files panel"
             style={{
-              flex: 1,
+              width: '26px',
+              height: '26px',
               display: 'flex',
-              alignItems: 'flex-start',
+              alignItems: 'center',
               justifyContent: 'center',
-              background: 'none',
-              border: 'none',
+              alignSelf: 'center',
+              background: theme.surface,
+              border: `1px solid ${theme.border}`,
+              borderRadius: '4px',
               color: theme.textMuted,
               cursor: 'pointer',
-              fontSize: '13px',
-              padding: '0.2rem 0',
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = theme.accentHover)}
-            onMouseLeave={(e) => (e.currentTarget.style.color = theme.textMuted)}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = theme.accentHover;
+              e.currentTarget.style.borderColor = theme.accentHover;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = theme.textMuted;
+              e.currentTarget.style.borderColor = theme.border;
+            }}
           >
-            ‹
+            <PanelChevronIcon direction="left" />
           </button>
         ) : (
           <>
@@ -1618,19 +1682,27 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
             onClick={() => setFileListCollapsed(true)}
             title="Collapse recording files panel"
             style={{
-              background: 'none',
-              border: 'none',
+              width: '26px',
+              height: '26px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: theme.surface,
+              border: `1px solid ${theme.border}`,
+              borderRadius: '4px',
               color: theme.textMuted,
               cursor: 'pointer',
-              fontSize: '13px',
-              padding: '0.1rem 0.3rem',
-              display: 'flex',
-              lineHeight: 1,
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = theme.accentHover)}
-            onMouseLeave={(e) => (e.currentTarget.style.color = theme.textMuted)}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = theme.accentHover;
+              e.currentTarget.style.borderColor = theme.accentHover;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = theme.textMuted;
+              e.currentTarget.style.borderColor = theme.border;
+            }}
           >
-            ›
+            <PanelChevronIcon direction="right" />
           </button>
         </div>
         <div style={{ display: 'flex', gap: '0.35rem' }}>

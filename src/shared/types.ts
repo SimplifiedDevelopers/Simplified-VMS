@@ -307,7 +307,7 @@ export interface RecordingSegment {
 // `value`'s meaning depends on the command: milliseconds for 'seek', a
 // speed multiplier (1/2/4) for 'setSpeed', unused for the rest.
 export type PlaybackCommand = 'pause' | 'resume' | 'seek' | 'setSpeed' | 'stepFrame';
-export type PlaybackSpeed = 1 | 2 | 4;
+export type PlaybackSpeed = 1 | 2 | 4 | 8;
 
 // Individually selectable via checkboxes in the Playback sidebar, so a
 // search can combine e.g. Motion + Smart while excluding Continuous — DVR/

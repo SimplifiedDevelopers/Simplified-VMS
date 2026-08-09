@@ -90,6 +90,15 @@ std::mutex g_mutex;
 // can only identify its session via the decode port number it was given.
 std::unordered_map<long, LiveViewSession*> g_sessionsByPort;
 std::unordered_map<long, LiveViewSession*> g_sessionsByHandle;
+// How many NET_DVR_PLAYFAST steps are currently applied per playback view
+// handle (absent/0 = normal speed) - see ControlPlaybackWorker's "setSpeed"
+// branch. A separate map (not a field on LiveViewSession) so
+// ControlPlaybackWorker never needs to hold a raw LiveViewSession* across
+// the async gap to its own Execute() call - it looks this up fresh, under
+// g_mutex, from inside Execute() itself, so a concurrent StopPlayback
+// deleting the session in between can't leave it pointing at freed memory.
+// Erased on stop, same as g_sessionsByHandle.
+std::unordered_map<long, int> g_speedStepsByHandle;
 
 // See the matching note in native/uniview/src/addon.cc. Scoped PER SESSION
 // (keyed by lUserID), not global — a global mutex was tried first and, on
@@ -884,8 +893,10 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
 // device.
 class ControlPlaybackWorker : public Napi::AsyncWorker {
  public:
-  ControlPlaybackWorker(Napi::Env env, long lPlayHandle, std::string command, DWORD seekPercent, int speedSteps)
+  ControlPlaybackWorker(Napi::Env env, long lUserID, long lPlayHandle, std::string command, DWORD seekPercent,
+                         int speedSteps)
       : Napi::AsyncWorker(env),
+        lUserID_(lUserID),
         lPlayHandle_(lPlayHandle),
         command_(std::move(command)),
         seekPercent_(seekPercent),
@@ -893,6 +904,16 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
+    // Every other native call for this device (Start/StopLiveView, Start/
+    // StopPlayback, FindRecordings) acquires this same per-device lock -
+    // this one was the exception, running fully unsynchronized against
+    // whatever else touches this device's SDK session concurrently (most
+    // notably the decode callback thread). Confirmed on TVT (the identical
+    // gap there) as the cause of an app crash when changing playback speed
+    // - applied here too before it gets a chance to surface the same way,
+    // since setSpeed's multi-call loop below is the widest unsynchronized
+    // window of any command handled here.
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
     BOOL ok = FALSE;
     DWORD outValue = 0;
     if (command_ == "pause") {
@@ -903,13 +924,47 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
       ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYSETPOS, seekPercent_, &outValue);
     } else if (command_ == "setSpeed") {
       // No documented explicit speed-multiplier parameter for PLAYFAST
-      // (same situation as TVT's NET_SDK_PLAYCTRL_FF) - called repeatedly
-      // from a normal-speed baseline to step through the device's own
-      // internal speed levels instead. Unverified against real hardware
-      // yet.
-      ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYNORMAL, 0, &outValue);
-      for (int i = 0; ok && i < speedSteps_; ++i) {
-        ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYFAST, 0, &outValue);
+      // (same situation as TVT's NET_SDK_PLAYCTRL_FF). speedSteps_ (1/2/4/8,
+      // see SpeedMultiplierToSteps below) is the TARGET absolute step
+      // count, not a delta. Confirmed live (via a temporary frame-arrival-
+      // rate diagnostic, since removed) that this vendor's fast-forward
+      // works by skipping ahead through keyframes rather than smoothly
+      // accelerating decode - content visibly jumps forward a few seconds
+      // at a time rather than looking like continuous fast motion (unlike
+      // Dahua/Uniview's real speed-multiplier APIs). Resetting to NORMAL
+      // then calling FAST that many times every call (the original
+      // approach) made this jumpy behavior noticeably worse/less reliable,
+      // the same shape of problem as TVT's NORMAL-then-immediately-FF
+      // sequence, which there caused an outright crash inside the vendor
+      // SDK. Applying the identical fix here: NORMAL still resets to 1x
+      // when requested, but for an accelerated target,
+      // g_speedStepsByHandle tracks what's already applied so only the
+      // DELTA of additional FAST calls is made, without ever touching
+      // NORMAL again until the next reset to 1x. Only needs to handle the
+      // forward-only 1x->2x->4x->8x->1x cycle Playback.tsx actually drives;
+      // delta<=0 can't happen from that UI, so it's treated as a no-op.
+      if (speedSteps_ == 0) {
+        ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYNORMAL, 0, &outValue);
+        if (ok) {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          g_speedStepsByHandle[lPlayHandle_] = 0;
+        }
+      } else {
+        int current = 0;
+        {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          auto it = g_speedStepsByHandle.find(lPlayHandle_);
+          if (it != g_speedStepsByHandle.end()) current = it->second;
+        }
+        const int delta = (speedSteps_ > current) ? (speedSteps_ - current) : 0;
+        ok = TRUE;
+        for (int i = 0; ok && i < delta; ++i) {
+          ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYFAST, 0, &outValue);
+        }
+        if (ok) {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          g_speedStepsByHandle[lPlayHandle_] = speedSteps_;
+        }
       }
     } else if (command_ == "stepFrame") {
       ok = NET_DVR_PlayBackControl(lPlayHandle_, NET_DVR_PLAYFRAME, 0, &outValue);
@@ -925,6 +980,7 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise GetPromise() { return deferred_.Promise(); }
 
  private:
+  long lUserID_;
   long lPlayHandle_;
   std::string command_;
   DWORD seekPercent_;
@@ -936,6 +992,7 @@ int SpeedMultiplierToSteps(int multiplier) {
   switch (multiplier) {
     case 2: return 1;
     case 4: return 2;
+    case 8: return 3;
     default: return 0;
   }
 }
@@ -945,14 +1002,16 @@ Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
   const long lPlayHandle = std::stol(info[0].As<Napi::String>().Utf8Value());
   const std::string command = info[1].As<Napi::String>().Utf8Value();
 
+  LiveViewSession* session = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_sessionsByHandle.find(lPlayHandle);
+    if (it != g_sessionsByHandle.end()) session = it->second;
+  }
+  const long lUserID = session ? session->lUserID : -1;
+
   DWORD seekPercent = 0;
   if (command == "seek") {
-    LiveViewSession* session = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(g_mutex);
-      auto it = g_sessionsByHandle.find(lPlayHandle);
-      if (it != g_sessionsByHandle.end()) session = it->second;
-    }
     const int64_t seekMs = static_cast<int64_t>(info[2].As<Napi::Number>().DoubleValue());
     if (session && session->endMs > session->beginMs) {
       double percent = static_cast<double>(seekMs - session->beginMs) /
@@ -964,7 +1023,7 @@ Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
   }
   const int speedSteps = (command == "setSpeed") ? SpeedMultiplierToSteps(info[2].As<Napi::Number>().Int32Value()) : 0;
 
-  auto* worker = new ControlPlaybackWorker(env, lPlayHandle, command, seekPercent, speedSteps);
+  auto* worker = new ControlPlaybackWorker(env, lUserID, lPlayHandle, command, seekPercent, speedSteps);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;
@@ -1032,6 +1091,11 @@ Napi::Value StopPlayback(const Napi::CallbackInfo& info) {
       g_sessionsByHandle.erase(it);
       g_sessionsByPort.erase(session->nPort);
     }
+    // g_speedStepsByHandle otherwise keeps an entry per view handle forever
+    // - handles are never reused, so this would grow unbounded over a long
+    // session with many channel switches, same class of leak fixed
+    // recently on the renderer's own videoHealthByHandle map.
+    g_speedStepsByHandle.erase(lPlayHandle);
   }
 
   auto* worker = new StopPlaybackWorker(env, session);

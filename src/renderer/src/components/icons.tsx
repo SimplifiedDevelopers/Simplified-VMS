@@ -117,3 +117,39 @@ export function RestoreIcon({ size = 15 }: { size?: number }) {
     </svg>
   );
 }
+
+// Double chevrons — collapse/expand toggle for a side panel (Playback's
+// Recording Files list, Live View's device tree). Bigger and bolder than
+// the plain '‹'/'›' text characters used here originally, which were hard
+// to notice per explicit user feedback. Matches Feather Icons'
+// "chevrons-left"/"chevrons-right" glyph shape (MIT licensed), same
+// reasoning as CameraOffIcon. `direction` is the way the panel will move
+// on click - pass 'left' for a left-pointing double chevron, 'right' for
+// right-pointing; the caller picks based on which edge the panel lives on
+// and whether this click collapses or expands it.
+export function PanelChevronIcon({ direction, size = 18 }: { direction: 'left' | 'right'; size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {direction === 'left' ? (
+        <>
+          <polyline points="11 17 6 12 11 7" />
+          <polyline points="18 17 13 12 18 7" />
+        </>
+      ) : (
+        <>
+          <polyline points="13 17 18 12 13 7" />
+          <polyline points="6 17 11 12 6 7" />
+        </>
+      )}
+    </svg>
+  );
+}

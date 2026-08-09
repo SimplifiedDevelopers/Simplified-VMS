@@ -1140,8 +1140,10 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
 // on" rule already established from Live View's own RealPlay hang.
 class ControlPlaybackWorker : public Napi::AsyncWorker {
  public:
-  ControlPlaybackWorker(Napi::Env env, LPVOID lpPlayHandle, std::string command, INT64 seekTime, INT32 speedValue)
+  ControlPlaybackWorker(Napi::Env env, LPVOID lUserID, LPVOID lpPlayHandle, std::string command, INT64 seekTime,
+                         INT32 speedValue)
       : Napi::AsyncWorker(env),
+        lUserID_(lUserID),
         lpPlayHandle_(lpPlayHandle),
         command_(std::move(command)),
         seekTime_(seekTime),
@@ -1149,6 +1151,14 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
+    // Every other native call for this device (Start/StopRealPlay, Start/
+    // StopPlayback, FindRecordings) acquires this same per-device lock -
+    // this one was the exception, running fully unsynchronized against
+    // whatever else touches this device's SDK session concurrently (most
+    // notably the decode callback thread). Confirmed on TVT (the identical
+    // gap there) as the cause of an app crash when changing playback speed
+    // - applied here too before it gets a chance to surface the same way.
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
     BOOL ok = FALSE;
     if (command_ == "pause") {
       ok = NETDEV_PlayBackControl(lpPlayHandle_, NETDEV_PLAY_CTRL_PAUSE, nullptr);
@@ -1176,6 +1186,7 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise GetPromise() { return deferred_.Promise(); }
 
  private:
+  LPVOID lUserID_;
   LPVOID lpPlayHandle_;
   std::string command_;
   INT64 seekTime_;
@@ -1183,13 +1194,14 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise::Deferred deferred_;
 };
 
-// speedMultiplier (1/2/4) -> NETDEV_VOD_PLAY_STATUS_E's forward-speed
+// speedMultiplier (1/2/4/8) -> NETDEV_VOD_PLAY_STATUS_E's forward-speed
 // values - the enum has a lot more entries (backward, I-frame-only variants
-// at higher speeds, etc.) but only forward 1x/2x/4x were ever requested.
+// at higher speeds, etc.) but only forward 1x/2x/4x/8x were ever requested.
 INT32 SpeedMultiplierToNetdevStatus(int multiplier) {
   switch (multiplier) {
     case 2: return NETDEV_PLAY_STATUS_2_FORWARD;
     case 4: return NETDEV_PLAY_STATUS_4_FORWARD;
+    case 8: return NETDEV_PLAY_STATUS_8_FORWARD;
     default: return NETDEV_PLAY_STATUS_1_FORWARD;
   }
 }
@@ -1203,7 +1215,14 @@ Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
   const INT32 speedValue =
       (command == "setSpeed") ? SpeedMultiplierToNetdevStatus(info[2].As<Napi::Number>().Int32Value()) : 0;
 
-  auto* worker = new ControlPlaybackWorker(env, lpPlayHandle, command, seekTime, speedValue);
+  LPVOID lUserID = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_sessionsByHandle.find(lpPlayHandle);
+    if (it != g_sessionsByHandle.end()) lUserID = it->second->lUserID;
+  }
+
+  auto* worker = new ControlPlaybackWorker(env, lUserID, lpPlayHandle, command, seekTime, speedValue);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;

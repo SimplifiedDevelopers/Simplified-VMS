@@ -72,6 +72,15 @@ struct LiveViewSession {
 
 std::mutex g_mutex;
 std::unordered_map<POINTERHANDLE, LiveViewSession*> g_sessionsByHandle;
+// How many NET_SDK_PLAYCTRL_FF steps are currently applied per playback
+// view handle (absent/0 = normal speed) - see ControlPlaybackWorker's
+// "setSpeed" branch. A separate map (not a field on LiveViewSession)
+// specifically so ControlPlaybackWorker never needs to hold a raw
+// LiveViewSession* across the async gap to its own Execute() call - it
+// looks this up fresh, under g_mutex, from inside Execute() itself, so a
+// concurrent StopPlayback deleting the session in between can't leave it
+// pointing at freed memory. Erased on stop, same as g_sessionsByHandle.
+std::unordered_map<POINTERHANDLE, DWORD> g_speedStepsByHandle;
 
 // See the matching note in native/uniview/src/addon.cc. Scoped PER SESSION
 // (keyed by lUserID), not global — a global mutex was tried first and, on
@@ -782,9 +791,10 @@ Napi::Value StartPlayback(const Napi::CallbackInfo& info) {
 // uncooperative device.
 class ControlPlaybackWorker : public Napi::AsyncWorker {
  public:
-  ControlPlaybackWorker(Napi::Env env, POINTERHANDLE lPlayHandle, std::string command, DWORD seekEpochSec,
-                         DWORD speedValue)
+  ControlPlaybackWorker(Napi::Env env, LONG lUserID, POINTERHANDLE lPlayHandle, std::string command,
+                         DWORD seekEpochSec, DWORD speedValue)
       : Napi::AsyncWorker(env),
+        lUserID_(lUserID),
         lPlayHandle_(lPlayHandle),
         command_(std::move(command)),
         seekEpochSec_(seekEpochSec),
@@ -792,6 +802,15 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
         deferred_(Napi::Promise::Deferred::New(env)) {}
 
   void Execute() override {
+    // Every other native call for this device (Start/StopLiveView, Start/
+    // StopPlayback, FindRecordings) acquires this same per-device lock -
+    // this one was the exception, running fully unsynchronized against
+    // whatever else touches this device's SDK session concurrently (most
+    // notably the decode callback thread). Confirmed live as the cause of
+    // an app crash when changing playback speed: setSpeed makes 1-3 back-
+    // to-back SDK calls in a tight loop below with no lock, by far the
+    // widest unsynchronized window of any command handled here.
+    std::lock_guard<std::mutex> sdkLock(SdkMutexForSession(lUserID_));
     BOOL ok = FALSE;
     DWORD outValue = 0;
     if (command_ == "pause") {
@@ -804,13 +823,46 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
       // No documented explicit speed-multiplier parameter for FF (unlike
       // Uniview's dedicated forward-speed enum) - the SDK header only shows
       // FF as a step control, called repeatedly to cycle through the
-      // device's own internal speed levels. speedValue_ (1/2/4, see
-      // SpeedMultiplierToFfSteps below) is treated as "how many times to
-      // call FF from a fresh normal-speed baseline" - unverified against
-      // real hardware yet.
-      ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_NORMAL, 0, &outValue);
-      for (DWORD i = 0; ok && i < speedValue_; ++i) {
-        ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_FF, 0, &outValue);
+      // device's own internal speed levels. speedValue_ (1/2/4/8, see
+      // SpeedMultiplierToFfSteps below) is the TARGET absolute step count,
+      // not a delta - resetting to NORMAL then calling FF that many times
+      // every call (the original approach) crashed with 0xc0000094
+      // (STATUS_INTEGER_DIVIDE_BY_ZERO), confirmed live via Windows Event
+      // Viewer to be INSIDE DVR_NET_SDK.dll itself, not our own code, and
+      // confirmed live that the NORMAL-then-immediately-FF sequence is what
+      // triggers it - going straight to FF with no reset first does not
+      // crash. Since FF only steps forward (no documented "step back"),
+      // NORMAL still resets to 1x when requested; for any accelerated
+      // target, g_speedStepsByHandle tracks what's already applied so only
+      // the DELTA of additional FF calls is made, keeping the resulting
+      // speed correct across repeated changes without ever touching NORMAL
+      // again until the next reset to 1x. This only needs to handle the
+      // forward-only 1x->2x->4x->8x->1x cycle Playback.tsx actually drives;
+      // delta<=0 (asking for a lower accelerated speed without passing back
+      // through 1x first) can't happen from that UI, so it's treated as a
+      // no-op rather than risking another NORMAL+FF sequence.
+      if (speedValue_ == 0) {
+        ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_NORMAL, 0, &outValue);
+        if (ok) {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          g_speedStepsByHandle[lPlayHandle_] = 0;
+        }
+      } else {
+        DWORD current = 0;
+        {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          auto it = g_speedStepsByHandle.find(lPlayHandle_);
+          if (it != g_speedStepsByHandle.end()) current = it->second;
+        }
+        const DWORD delta = (speedValue_ > current) ? (speedValue_ - current) : 0;
+        ok = TRUE;
+        for (DWORD i = 0; ok && i < delta; ++i) {
+          ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_FF, 0, &outValue);
+        }
+        if (ok) {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          g_speedStepsByHandle[lPlayHandle_] = speedValue_;
+        }
       }
     } else if (command_ == "stepFrame") {
       ok = NET_SDK_PlayBackControl(lPlayHandle_, NET_SDK_PLAYCTRL_FRAME, 0, &outValue);
@@ -826,6 +878,7 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise GetPromise() { return deferred_.Promise(); }
 
  private:
+  LONG lUserID_;
   POINTERHANDLE lPlayHandle_;
   std::string command_;
   DWORD seekEpochSec_;
@@ -833,12 +886,13 @@ class ControlPlaybackWorker : public Napi::AsyncWorker {
   Napi::Promise::Deferred deferred_;
 };
 
-// speedMultiplier (1/2/4) -> number of FF steps from normal speed - see the
-// matching comment on ControlPlaybackWorker's "setSpeed" branch.
+// speedMultiplier (1/2/4/8) -> number of FF steps from normal speed - see
+// the matching comment on ControlPlaybackWorker's "setSpeed" branch.
 DWORD SpeedMultiplierToFfSteps(int multiplier) {
   switch (multiplier) {
     case 2: return 1;
     case 4: return 2;
+    case 8: return 3;
     default: return 0;
   }
 }
@@ -852,7 +906,17 @@ Napi::Value ControlPlayback(const Napi::CallbackInfo& info) {
   const DWORD speedValue =
       (command == "setSpeed") ? SpeedMultiplierToFfSteps(info[2].As<Napi::Number>().Int32Value()) : 0;
 
-  auto* worker = new ControlPlaybackWorker(env, lPlayHandle, command, seekEpochSec, speedValue);
+  // Resolved here (not inside the worker) so the lock the worker takes is
+  // against the right device even though only lPlayHandle is passed in from
+  // JS - mirrors StopLiveView/StopPlayback's own session lookup.
+  LONG lUserID = -1;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_sessionsByHandle.find(lPlayHandle);
+    if (it != g_sessionsByHandle.end()) lUserID = it->second->lUserID;
+  }
+
+  auto* worker = new ControlPlaybackWorker(env, lUserID, lPlayHandle, command, seekEpochSec, speedValue);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;
@@ -919,6 +983,11 @@ Napi::Value StopPlayback(const Napi::CallbackInfo& info) {
       session = it->second;
       g_sessionsByHandle.erase(it);
     }
+    // g_speedStepsByHandle otherwise keeps an entry per view handle forever
+    // - handles are never reused, so this would grow unbounded over a long
+    // session with many channel switches, same class of leak fixed
+    // recently on the renderer's own videoHealthByHandle map.
+    g_speedStepsByHandle.erase(lPlayHandle);
   }
 
   auto* worker = new StopPlaybackWorker(env, session);

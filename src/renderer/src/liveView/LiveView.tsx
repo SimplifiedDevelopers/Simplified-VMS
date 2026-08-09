@@ -19,7 +19,7 @@ import { LayoutPickerPopup } from './LayoutPickerPopup';
 import { LAYOUTS, getLayoutShape } from './layoutDefs';
 import emptyTileCamera from '../assets/empty-tile-camera.png';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { CameraIcon, CameraOffIcon, RecordIcon, RestoreIcon, StopIcon } from '../components/icons';
+import { CameraIcon, CameraOffIcon, PanelChevronIcon, RecordIcon, RestoreIcon, StopIcon } from '../components/icons';
 
 interface TileState {
   deviceId: string;
@@ -163,6 +163,12 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
   const [layoutPickerOpen, setLayoutPickerOpen] = useState(false);
   const [devicesCollapsed, setDevicesCollapsed] = useState(false);
   const [customLayoutsCollapsed, setCustomLayoutsCollapsed] = useState(false);
+  // Collapses the WHOLE left sidebar to a thin strip to reclaim grid width
+  // — distinct from devicesCollapsed/customLayoutsCollapsed above, which
+  // only fold their own section within an otherwise-still-visible sidebar.
+  // Mirrors Playback's own Recording Files panel collapse (added first,
+  // per explicit follow-up request to add the same option here).
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [customLayouts, setCustomLayouts] = useState<CustomLayout[]>([]);
   const [savingLayout, setSavingLayout] = useState(false);
   const [pendingDeleteLayout, setPendingDeleteLayout] = useState<CustomLayout | null>(null);
@@ -1259,13 +1265,70 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
     <div style={{ height: '100%', display: 'flex' }}>
       <div
         style={{
-          width: '220px',
+          width: sidebarCollapsed ? '34px' : '220px',
           flexShrink: 0,
           borderRight: `1px solid ${theme.border}`,
-          overflowY: 'auto',
-          padding: '0.5rem',
+          overflowY: sidebarCollapsed ? 'hidden' : 'auto',
+          padding: sidebarCollapsed ? '0.5rem 0.25rem' : '0.5rem',
         }}
       >
+        {sidebarCollapsed ? (
+          <button
+            onClick={() => setSidebarCollapsed(false)}
+            title="Expand device tree"
+            style={{
+              width: '26px',
+              height: '26px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: theme.surface,
+              border: `1px solid ${theme.border}`,
+              borderRadius: '4px',
+              color: theme.textMuted,
+              cursor: 'pointer',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = theme.accentHover;
+              e.currentTarget.style.borderColor = theme.accentHover;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = theme.textMuted;
+              e.currentTarget.style.borderColor = theme.border;
+            }}
+          >
+            <PanelChevronIcon direction="right" />
+          </button>
+        ) : (
+          <>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.35rem' }}>
+          <button
+            onClick={() => setSidebarCollapsed(true)}
+            title="Collapse device tree"
+            style={{
+              width: '26px',
+              height: '26px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: theme.surface,
+              border: `1px solid ${theme.border}`,
+              borderRadius: '4px',
+              color: theme.textMuted,
+              cursor: 'pointer',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = theme.accentHover;
+              e.currentTarget.style.borderColor = theme.accentHover;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = theme.textMuted;
+              e.currentTarget.style.borderColor = theme.border;
+            }}
+          >
+            <PanelChevronIcon direction="left" />
+          </button>
+        </div>
         <SidebarSectionHeader
           title="Devices"
           collapsed={devicesCollapsed}
@@ -1430,6 +1493,8 @@ export function LiveView({ isActive = true }: { isActive?: boolean } = {}) {
               </div>
             ))}
           </div>
+        )}
+          </>
         )}
       </div>
 
