@@ -6,9 +6,10 @@ import { TileContextMenu } from '../liveView/TileContextMenu';
 import { MiniCalendar } from './MiniCalendar';
 import { CameraOffIcon } from '../components/icons';
 import { PauseIcon, PlayIcon, ScissorsIcon, StepForwardIcon, StopIcon } from './icons';
-import { Centered, Legend, ToolbarIconButton, TransportButton, ZoomButton } from './PlaybackControls';
+import { Centered, ToolbarIconButton, TransportButton } from './PlaybackControls';
 import { PlaybackSidebar } from './PlaybackSidebar';
 import { RecordingFilesPanel } from './RecordingFilesPanel';
+import { PlaybackTimeline } from './PlaybackTimeline';
 import { ExportPopup } from './ExportPopup';
 import { SearchByTimePopup } from './SearchByTimePopup';
 import { DownloadsPopup } from './DownloadsPopup';
@@ -19,9 +20,7 @@ import {
   LAYOUTS,
   MAX_TILES,
   resourceLevelColor,
-  TYPE_COLOR,
   ZOOM_LEVELS,
-  zoomLabel,
   type ClipMark,
   type DownloadItem,
   type ExportPopupState,
@@ -1166,165 +1165,27 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
           {displayIndices.map((i) => renderTile(i))}
         </div>
 
-        {/* Full-width timeline — moved here (below the grid) instead of a
-            cramped sidebar strip, giving it real room for a proper 24h ruler. */}
-        <div style={{ borderTop: `1px solid ${theme.border}`, padding: '0.5rem 0.9rem 0.3rem' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', alignItems: 'center', marginBottom: '0.35rem' }}>
-            <div style={{ display: 'flex', gap: '0.6rem', fontSize: '10px', color: theme.textFaint }}>
-              <Legend color={TYPE_COLOR.continuous} label="Continuous" />
-              <Legend color={TYPE_COLOR.motion} label="Motion" />
-              <Legend color={TYPE_COLOR.smart} label="Smart" />
-            </div>
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '10px', color: theme.textFaint }}>
-              <ZoomButton
-                disabled={zoom === ZOOM_LEVELS[0]}
-                onClick={() => setZoom(ZOOM_LEVELS[Math.max(0, ZOOM_LEVELS.indexOf(zoom) - 1)])}
-              >
-                −
-              </ZoomButton>
-              <span style={{ minWidth: '38px', textAlign: 'center', color: theme.textMuted }}>{zoomLabel(zoom)}</span>
-              <ZoomButton
-                disabled={zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
-                onClick={() => setZoom(ZOOM_LEVELS[Math.min(ZOOM_LEVELS.length - 1, ZOOM_LEVELS.indexOf(zoom) + 1)])}
-              >
-                +
-              </ZoomButton>
-            </div>
-
-            <span style={{ justifySelf: 'end', fontSize: '11px', color: theme.textMuted }}>
-              {selectedTile.deviceName
-                ? `${selectedTile.deviceName} · ${selectedTile.channelLabel}${selectedTile.searching ? ' — searching…' : ''}`
-                : 'No channel selected for this tile'}
-            </span>
-          </div>
-
-          {/* Zoom widens this inner wrapper (not the outer container) and
-              lets it scroll horizontally — a short motion clip that's a
-              couple of pixels wide at 1x becomes proportionally easier to
-              click at higher zoom. handleTimelineClick's fraction math
-              (offsetX / rect.width) needs no changes for this to work:
-              rect.width and clientX are both already viewport-relative and
-              account for scroll position automatically. */}
-          <div style={{ overflowX: zoom > 1 ? 'auto' : 'hidden' }}>
-            <div style={{ width: `${zoom * 100}%`, minWidth: '100%' }}>
-              <div
-                onClick={handleTimelineClick}
-                onMouseMove={handleTimelineHover}
-                onMouseLeave={() => {
-                  setTimelineHoverX(null);
-                  setTimelineHoverMs(null);
-                }}
-                style={{
-                  height: '52px',
-                  borderRadius: '3px',
-                  background: theme.surface,
-                  border: `1px solid ${theme.border}`,
-                  position: 'relative',
-                  cursor: selectedTile.segments.length > 0 ? 'pointer' : 'default',
-                  overflow: 'hidden',
-                }}
-              >
-                {selectedTile.segments.map((seg, i) => {
-                  const left = ((seg.startMs - dayStartMs) / DAY_MS) * 100;
-                  const width = ((seg.endMs - seg.startMs) / DAY_MS) * 100;
-                  return (
-                    <div
-                      key={i}
-                      style={{
-                        position: 'absolute',
-                        left: `${left}%`,
-                        width: `${Math.max(width, 0.15)}%`,
-                        top: 0,
-                        bottom: 0,
-                        background: TYPE_COLOR[seg.type],
-                        opacity: 0.75,
-                      }}
-                    />
-                  );
-                })}
-                {timelineHoverX !== null && timelineHoverMs !== null && (
-                  <div
-                    style={{
-                      position: 'absolute',
-                      left: `${timelineHoverX}px`,
-                      top: 0,
-                      bottom: 0,
-                      width: '1px',
-                      background: theme.textFaint,
-                      pointerEvents: 'none',
-                    }}
-                  >
-                    <span
-                      style={{
-                        position: 'absolute',
-                        top: '3px',
-                        left: '50%',
-                        transform: 'translateX(-50%)',
-                        whiteSpace: 'nowrap',
-                        fontSize: '10.5px',
-                        color: theme.text,
-                        background: theme.panel,
-                        border: `1px solid ${theme.border}`,
-                        borderRadius: '3px',
-                        padding: '0.1rem 0.35rem',
-                        pointerEvents: 'none',
-                      }}
-                    >
-                      {formatTime(timelineHoverMs)}
-                    </span>
-                  </div>
-                )}
-                {clipMark && markMatchesSelectedTile && (
-                  <div
-                    title={`Clip start: ${formatTime(clipMark.startMs)}`}
-                    style={{
-                      position: 'absolute',
-                      left: `${((clipMark.startMs - dayStartMs) / DAY_MS) * 100}%`,
-                      top: 0,
-                      bottom: 0,
-                      width: '2px',
-                      background: theme.success,
-                    }}
-                  />
-                )}
-                {selectedTile.currentMs !== null && (
-                  <div
-                    style={{
-                      position: 'absolute',
-                      left: `${((selectedTile.currentMs - dayStartMs) / DAY_MS) * 100}%`,
-                      top: 0,
-                      bottom: 0,
-                      width: '2px',
-                      background: theme.text,
-                    }}
-                  />
-                )}
-                {selectedTile.segments.length === 0 && (selectedTile.searching || selectedTile.deviceId) && (
-                  <div
-                    style={{
-                      position: 'absolute',
-                      inset: 0,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      fontSize: '10.5px',
-                      color: theme.textFaint,
-                    }}
-                  >
-                    {selectedTile.searching ? 'Searching…' : 'No recordings found for this day'}
-                  </div>
-                )}
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '9.5px', color: theme.textFaint, marginTop: '2px' }}>
-                {Array.from({ length: 13 }, (_, i) => (
-                  <span key={i}>{String(i * 2).padStart(2, '0')}:00</span>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
+        <PlaybackTimeline
+          zoom={zoom}
+          onZoomChange={setZoom}
+          deviceName={selectedTile.deviceName}
+          channelLabel={selectedTile.channelLabel}
+          searching={selectedTile.searching}
+          segments={selectedTile.segments}
+          dayStartMs={dayStartMs}
+          onTimelineClick={handleTimelineClick}
+          onTimelineHover={handleTimelineHover}
+          timelineHoverX={timelineHoverX}
+          timelineHoverMs={timelineHoverMs}
+          onTimelineMouseLeave={() => {
+            setTimelineHoverX(null);
+            setTimelineHoverMs(null);
+          }}
+          clipMark={clipMark}
+          markMatchesSelectedTile={markMatchesSelectedTile}
+          currentMs={selectedTile.currentMs}
+          hasDeviceSelected={!!selectedTile.deviceId}
+        />
 
         {/* Bottom bar — a true 3-column grid (not flex+spacers) so the
             center transport cluster stays visually centered regardless of
