@@ -17,16 +17,14 @@ import {
   TransportButton,
   ZoomButton,
 } from './PlaybackControls';
+import { PlaybackSidebar } from './PlaybackSidebar';
 import {
   DAY_MS,
   emptyTile,
-  FILTER_OPTIONS,
   formatTime,
   LAYOUTS,
   MAX_TILES,
   resourceLevelColor,
-  statusColor,
-  statusLabel,
   TYPE_COLOR,
   ZOOM_LEVELS,
   zoomLabel,
@@ -1123,140 +1121,40 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
 
   return (
     <div style={{ height: '100%', display: 'flex' }}>
-      <div
-        style={{
-          width: '220px',
-          flexShrink: 0,
-          borderRight: `1px solid ${theme.border}`,
-          padding: '0.75rem',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '0.75rem',
+      <PlaybackSidebar
+        devices={devices}
+        expandedDeviceId={expandedDeviceId}
+        onToggleExpandDevice={toggleExpandDevice}
+        loadingChannelsFor={loadingChannelsFor}
+        channelErrors={channelErrors}
+        channelsByDevice={channelsByDevice}
+        onAssignChannel={assignChannelToTile}
+        statusById={statusById}
+        filters={filters}
+        onToggleFilter={toggleFilter}
+        selectedDeviceId={selectedTile.deviceId}
+        selectedChannel={selectedTile.channel}
+        onOpenSearchByTime={() => {
+          setSearchByTimeDate(date);
+          setSearchByTimeStart('00:00');
+          setSearchByTimeEnd('23:59');
+          setSearchByTimeOpen(true);
         }}
-      >
-        {/* Only the device tree scrolls — Recording Type, the calendar, and
-            Search below stay put and always visible, regardless of how many
-            devices/channels are expanded above or how short the window is.
-            Previously the whole sidebar was one scrolling column, so a
-            long/expanded device list could push the calendar out of view
-            entirely. */}
-        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-          <div style={{ fontSize: '11px', color: theme.textMuted, marginBottom: '0.2rem' }}>DEVICES</div>
-          <div style={{ marginTop: '-0.5rem' }}>
-            {devices.length === 0 && <div style={{ fontSize: '11.5px', color: theme.textFaint, padding: '0.5rem' }}>No devices yet.</div>}
-            {devices.map((device) => (
-            <div key={device.id} style={{ marginBottom: '0.1rem' }}>
-              <div
-                onClick={() => toggleExpandDevice(device.id)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.4rem',
-                  padding: '0.35rem 0.4rem',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '12.5px',
-                  color: theme.text,
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = theme.surface)}
-                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-              >
-                <span style={{ color: theme.textFaint, fontSize: '10px', width: '10px' }}>
-                  {expandedDeviceId === device.id ? '▾' : '▸'}
-                </span>
-                <span
-                  title={statusLabel(statusById[device.id])}
-                  style={{
-                    width: '7px',
-                    height: '7px',
-                    borderRadius: '50%',
-                    background: statusColor(statusById[device.id]),
-                    flexShrink: 0,
-                  }}
-                />
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{device.name}</span>
-              </div>
-
-              {expandedDeviceId === device.id && (
-                <div style={{ paddingLeft: '1.4rem' }}>
-                  {loadingChannelsFor === device.id && (
-                    <div style={{ fontSize: '11px', color: theme.textFaint, padding: '0.3rem 0' }}>Loading…</div>
-                  )}
-                  {channelErrors[device.id] && (
-                    <div style={{ padding: '0.3rem 0' }}>
-                      <span style={{ fontSize: '11px', color: theme.danger }}>{channelErrors[device.id]}</span>
-                    </div>
-                  )}
-                  {(channelsByDevice[device.id] ?? []).map((ch) => (
-                    <div
-                      key={ch.channel}
-                      onClick={() => assignChannelToTile(device.id, ch.channel)}
-                      style={{ padding: '0.25rem 0.4rem', borderRadius: '4px', cursor: 'pointer', fontSize: '12px', color: theme.textMuted }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = theme.surface)}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                    >
-                      {ch.label}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: '11px', color: theme.textMuted, marginBottom: '0.4rem', textAlign: 'center' }}>
-            RECORDING TYPE
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem 0.5rem' }}>
-            {FILTER_OPTIONS.map((opt) => (
-              <label
-                key={opt.value}
-                style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '12px', color: theme.text, cursor: 'pointer' }}
-              >
-                <input
-                  type="checkbox"
-                  checked={filters.includes(opt.value)}
-                  onChange={() => toggleFilter(opt.value)}
-                  style={{ width: '13px', height: '13px', accentColor: theme.accent, cursor: 'pointer', flexShrink: 0 }}
-                />
-                {opt.label}
-              </label>
-            ))}
-          </div>
-        </div>
-
-        <MiniCalendar
-          selectedDate={date}
-          onSelect={(d) => {
-            // Picking a new calendar day means "show me this whole day" —
-            // clears any narrower window a previous Search by Time set.
-            setCustomRangeMs(null);
-            setDate(d);
-          }}
-          deviceId={selectedTile.deviceId}
-          channel={selectedTile.channel}
-          filters={filters}
-        />
-
-        <button
-          onClick={() => {
-            setSearchByTimeDate(date);
-            setSearchByTimeStart('00:00');
-            setSearchByTimeEnd('23:59');
-            setSearchByTimeOpen(true);
-          }}
-          disabled={!selectedTile.deviceId || selectedTile.channel === null}
-          style={{
-            ...searchButtonStyle,
-            opacity: !selectedTile.deviceId || selectedTile.channel === null ? 0.5 : 1,
-            cursor: !selectedTile.deviceId || selectedTile.channel === null ? 'not-allowed' : 'pointer',
-          }}
-        >
-          Search by Time
-        </button>
-      </div>
+        calendar={
+          <MiniCalendar
+            selectedDate={date}
+            onSelect={(d) => {
+              // Picking a new calendar day means "show me this whole day" —
+              // clears any narrower window a previous Search by Time set.
+              setCustomRangeMs(null);
+              setDate(d);
+            }}
+            deviceId={selectedTile.deviceId}
+            channel={selectedTile.channel}
+            filters={filters}
+          />
+        }
+      />
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {/* Video grid */}
