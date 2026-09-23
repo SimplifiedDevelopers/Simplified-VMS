@@ -60,7 +60,11 @@ export function registerDeviceIpcHandlers(): void {
   });
 
   ipcMain.handle('devices:testConnection', (_event, input: NewDeviceInput): Promise<ConnectionTestResult> =>
-    testLogin(input.vendor, input),
+    // Same substitution as deviceStore.ts's getDeviceCredentials — Uniview's
+    // login always uses the HTTP port, never the Service Port field, and
+    // this pre-save test should fail/succeed consistently with the real
+    // connect that follows Save, not disagree with it.
+    testLogin(input.vendor, { ...input, port: input.vendor === 'uniview' ? input.httpPort : input.port }),
   );
 
   // Live View sidebar's per-channel "Rename" - see deviceStore's

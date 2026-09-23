@@ -123,7 +123,17 @@ export function getDeviceCredentials(id: string): DeviceCredentials | null {
   const record = readAll().find((r) => r.id === id);
   if (!record) return null;
   const password = safeStorage.decryptString(Buffer.from(record.encryptedPassword, 'base64'));
-  return { vendor: record.vendor, host: record.host, port: record.port, username: record.username, password };
+  // Uniview's private-protocol login (NETDEV_Login_V30) always connects on
+  // the device's HTTP/web port, never a separately configured service
+  // port - confirmed live: entering the RTSP port (554) there fails to
+  // connect at all, even though that's what "Service Port" would suggest
+  // for the other 3 vendors, each of which does have its own dedicated SDK
+  // port distinct from both RTSP and HTTP. Rather than rely on every
+  // Uniview device being configured with the field's port value, just
+  // ignore it for this vendor and always use httpPort (already a required
+  // field on every device, so this never falls back to nothing).
+  const port = record.vendor === 'uniview' ? record.httpPort : record.port;
+  return { vendor: record.vendor, host: record.host, port, username: record.username, password };
 }
 
 // Backup/Restore Configuration and Export/Import Devices List (see

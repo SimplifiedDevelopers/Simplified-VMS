@@ -156,8 +156,13 @@ export function DeviceDialog({ initial, prefill, onSave, onCancel }: Props) {
             <input value={host} onChange={(e) => setHost(e.target.value)} style={inputStyle} />
           </Field>
           <Field label="Service Port">
-            <input value={port} onChange={(e) => setPort(e.target.value)} style={inputStyle} />
-            {prefill && !initial && (
+            <input value={port} onChange={(e) => setPort(e.target.value)} disabled={vendor === 'uniview'} style={inputStyle} />
+            {vendor === 'uniview' && (
+              <span style={{ fontSize: '10.5px', color: theme.textMuted }}>
+                Not used for Uniview — it always connects on the HTTP port below instead.
+              </span>
+            )}
+            {vendor !== 'uniview' && prefill && !initial && (
               <span style={{ fontSize: '10.5px', color: theme.warning }}>
                 Guessed default for this vendor — network discovery can't detect a device's actual configured SDK
                 port. Verify this matches your device's settings before saving.
