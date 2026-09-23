@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck-and-build:
+    # ubuntu-latest is enough here — typecheck/build only touch the TS/React
+    # sources bundled by electron-vite, never the native vendor SDK addons
+    # (those require each vendor's proprietary Windows-only SDK, which isn't
+    # in this repo, and are built separately via the build:*-native scripts
+    # against real hardware on the Windows test machine, not in CI).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build

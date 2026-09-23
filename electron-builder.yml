@@ -8,7 +8,7 @@ directories:
 # require that, and it'd be extractable from the installer by anyone).
 publish:
   provider: github
-  owner: simplifieddevs
+  owner: SimplifiedDevelopers
   repo: Simplified-VMS
 files:
   - out/**/*
