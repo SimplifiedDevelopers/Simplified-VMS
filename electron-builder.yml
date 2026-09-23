@@ -6,9 +6,12 @@ directories:
 # so electron-updater can fetch release metadata/assets without needing a
 # token baked into every installed copy of the app (a private repo would
 # require that, and it'd be extractable from the installer by anyone).
+# The owner must be the org the repo actually lives in — installed copies
+# read this from app-update.yml baked into the installer, so a wrong owner
+# means Check for Updates can never find a release.
 publish:
   provider: github
-  owner: simplifieddevs
+  owner: SimplifiedDevelopers
   repo: Simplified-VMS
 files:
   - out/**/*
