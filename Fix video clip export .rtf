@@ -1,0 +1,77 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 # Fix video clip export by self-recording playback frames via ffmpeg\
+\
+## Context\
+\
+Downloading a playback clip currently routes through each vendor's own native SDK "backup/download" call (`adapter.startBackup` \uc0\u8594  poll `adapter.getBackupProgress` \u8594  `adapter.stopBackup`, in [playback.ts](src/main/ipc/playback.ts:247)). This is broken across the board:\
+\
+- **Dahua** never implemented `startBackup` at all \'97 clicking Download just does nothing (the IPC handler throws, and the renderer has no `try/catch` around the call, so the error is silently swallowed as an unhandled rejection).\
+- **Hikvision, TVT, Uniview** do implement it, but the exported file frequently ends up 0 bytes even when progress reports "100% done." There's already a partial mitigation in [Playback.tsx:342-397](src/renderer/src/playback/Playback.tsx:342) (call `stopBackup` on hitting 100% to force a flush, then `verifyExportedFile` to check real size) but it's still unreliable in practice.\
+\
+Since on-screen Playback already reliably decodes frames for all vendors via `adapter.startPlayback(sessionId, channel, startMs, endMs, onFrame)` (delivering `DecodedFrame\{width,height,format,data,timestampMs\}`), the fix is to stop depending on each vendor's flaky bulk-download SDK path entirely. Instead, run a background (non-rendered) playback session for the requested range and pipe every decoded frame straight into ffmpeg to encode the destination MP4 ourselves \'97 one vendor-agnostic mechanism instead of four fragile ones.\
+\
+## Confirmed facts driving the design\
+\
+- All 4 vendors' `startPlayback` deliver frames essentially at real presentation speed (the vendor SDK's own "play" mode paces this internally \'97 that's why on-screen scrubbing already behaves correctly) \'97 **except** Uniview, whose native addon (`native/uniview/src/addon.cc`, `kPlaybackFrameIntervalMs = 80` ~line 59, drop check ~lines 163-169) caps playback-session frames at ~12.5fps regardless of caller. Accepted as a known v1 limitation (choppier but non-zero-byte and watchable); bypassing it would mean adding an `isExport` flag through the native addon \'97 flagged as a separate future follow-up, not part of this change.\
+- `DecodedFrame.format` is always `'rgb32'` (RGBA bytes) in practice across all 4 vendors \'97 never `yuv420p`.\
+- `setSpeed` is unreliable for Hikvision/TVT (native comments mark it "unverified"), so capture at normal 1x only \'97 an export takes roughly the clip's real duration, same order as a real backup transfer anyway.\
+- No per-device session-concurrency limit in `connectionManager.ts` blocks a second background playback session running alongside whatever's on-screen.\
+- `frameBackpressure.ts`'s throttling is only wired into the renderer-forwarding path in `playback.ts`'s `playback:start`/`liveView.ts` \'97 calling `adapter.startPlayback` directly (as this new service will) bypasses it, receiving every frame.\
+- ffmpeg is already bundled and this exact spawn pattern already exists for a different purpose in [onvif.ts](src/main/adapters/onvif.ts:40): `resolveFfmpegPath()` (dev: `require('ffmpeg-static')`, packaged: `process.resourcesPath/ffmpeg.exe`) and `killProcessTree()` (Windows `taskkill /pid <pid> /T /F`, since plain SIGTERM doesn't reliably kill ffmpeg's tree). `electron-builder.yml` already ships `ffmpeg.exe`/`ffprobe.exe` as extraResources \'97 no build config changes needed.\
+- ONVIF has no `startPlayback` at all \'97 it should keep falling through to the existing "not supported" error, unchanged.\
+- No test suite exists in this repo at all \'97 verification here is manual, against real hardware.\
+\
+## Implementation\
+\
+### 1. New service: `src/main/services/clipExporter.ts`\
+\
+Module-level `Map<string, ExportJob>` keyed by a generated handle (mirrors the style of `frameBackpressure.ts`/`connectionManager.ts` \'97 no class needed).\
+\
+- **`startExport(deviceId, channel, startMs, endMs, filePath, adapter, sessionId): Promise<string>`**\
+  - Registers the job, then calls `adapter.startPlayback(sessionId, channel, startMs, endMs, onFrame)`.\
+  - `onFrame`: resets a ~5s inactivity timer (no explicit "playback ended" signal exists on `VmsAdapter`, so this is what detects natural completion); updates `progress = clamp(((frame.timestampMs - startMs)/(endMs-startMs))*100, 0, 100)`; on the **first** frame, lazily spawns ffmpeg (via the same `resolveFfmpegPath()` helper, extracted into a small shared `src/main/services/ffmpegPath.ts` used by both `onvif.ts` and this file) sized to that frame's actual width/height:\
+    `-f rawvideo -pix_fmt rgba -s \{w\}x\{h\} -use_wallclock_as_timestamps 1 -i pipe:0 -an -c:v libx264 -pix_fmt yuv420p -movflags +faststart -y \{filePath\}`\
+  - Guards against the theoretical `format !== 'rgb32'` case (cheap safety check on the first frame only, since the type technically allows `yuv420p` even though it never happens today) by aborting the export with a clear error instead of silently feeding mismatched bytes to ffmpeg.\
+  - Writes `frame.data` to `ffmpegProc.stdin`, respecting `write()`'s backpressure return value with a small bounded internal queue (flushed on `'drain'`) rather than assuming every write succeeds synchronously.\
+- **Shared finalize path** (used by the inactivity timeout, a natural end, and explicit cancel \'97 guarded by a `finalizing` flag so it only ever runs once per job, same idea as the renderer's own `finalizingHandlesRef`): best-effort `adapter.stopPlayback(viewHandle)`, end ffmpeg's stdin, wait briefly for exit, hard-kill via the shared `killProcessTree` helper (extracted from `onvif.ts`) if it doesn't exit promptly. If ffmpeg was never spawned (zero frames \'97 empty range), there's nothing to finalize; `verifyExportedFile`'s existing `statSync` already reports that as a failed/empty export with no changes needed there.\
+- **`getExportProgress(handle): number`** \'97 returns in-memory progress, or `100` for an unknown handle (matches the existing "connection gone \uc0\u8594  report 100" fallback already in `playback.ts`).\
+- **`stopExport(handle): Promise<void>`** \'97 triggers the same finalize path; must stay callable during app quit (the module itself never checks any "quitting" flag \'97 that gating stays `playback.ts`'s job, same as today).\
+- **`stopAllExports(): Promise<void>`** \'97 new, finalizes every still-active job in parallel. This closes a real gap: today nothing tears down an in-flight export's ffmpeg process or native session on quit (the existing `pendingCalls` tracking in `playback.ts` only covers short native call dispatches, not a multi-minute export). Wire this into [index.ts:278](src/main/index.ts:278)'s existing `Promise.allSettled([disconnectAll(), waitForPendingPlaybackCalls(), waitForPendingLiveViewCalls()])` so a quit-during-export doesn't leak an orphaned `ffmpeg.exe` or skip `stopPlayback`.\
+\
+### 2. Rewire `src/main/ipc/playback.ts` (lines 247-291)\
+\
+- `playback:startBackup`: swap the `if (!adapter.startBackup)` gate for `if (!adapter.startPlayback || !adapter.stopPlayback)` (true only for ONVIF today \'97 the intended fallback), then call `tracked(clipExporter.startExport(...))` instead of `adapter.startBackup(...)`.\
+- `playback:getBackupProgress`: call `clipExporter.getExportProgress(downloadHandle)` instead of `adapter.getBackupProgress(...)` \'97 purely in-memory now, no native call.\
+- `playback:stopBackup`: call `clipExporter.stopExport(downloadHandle)` instead of `adapter.stopBackup(...)` \'97 keep this handler **not** `assertNotQuitting()`-guarded, same as today, so cancel/cleanup still works mid-quit.\
+- `playback:verifyExportedFile`: unchanged, reused as-is.\
+- Update the now-stale doc comment above `registerPlaybackIpcHandlers` (currently says "only Uniview has [backup] implemented") to describe the new ffmpeg-based mechanism.\
+\
+### 3. Deliberately leave vendor-native backup code untouched\
+\
+Do not modify `src/main/adapters/\{hikvision,tvt,uniview\}.ts`'s `startBackup`/`getBackupProgress`/`stopBackup`, or the matching native bindings in their `addon.cc` files, or the optional methods on `VmsAdapter`. They simply become unused once `playback.ts` no longer calls them \'97 kept in place purely to keep this change's blast radius small and avoid any native-addon recompilation risk. Add a one-line note on `VmsAdapter`'s doc comment marking them superseded by `clipExporter.ts`.\
+\
+### 4. Renderer: no changes needed\
+\
+The `startBackup`/`getBackupProgress`/`stopBackup`/`verifyExportedFile` IPC contract is unchanged, so [Playback.tsx](src/renderer/src/playback/Playback.tsx) needs no edits \'97 its existing poll/finalize/verify chain (lines 342-397) and popup handlers (lines 716-753) work as-is against the new backend. No vendor-specific "not supported" text exists in the renderer to clean up.\
+\
+## Verification\
+\
+No automated tests exist in this repo \'97 this needs manual verification against real hardware:\
+1. Build the packaged app (so the `app.isPackaged` ffmpeg.exe path is actually exercised, not just dev-mode `ffmpeg-static`).\
+2. Per vendor (Dahua, Hikvision, TVT, Uniview): search recordings in Playback, mark/select a clip, click Download, confirm the resulting `.mp4` is non-zero bytes **and** actually plays correctly in a real player (not just a byte-count check \'97 a stdin-ordering bug could still produce a non-empty but corrupt file).\
+3. Confirm Dahua now works at all (previously did nothing).\
+4. Confirm Uniview's export is capped at ~12.5fps (expected, per the native throttle) but still a valid, watchable file.\
+5. Confirm Stop/cancel mid-export leaves no orphaned `ffmpeg.exe` in Task Manager, and same check after quitting the app with an export in flight.\
+6. Confirm ONVIF still cleanly reports "not supported" rather than hanging.\
+\
+## Known trade-offs (called out explicitly, not blockers)\
+\
+- Completion detection uses a ~5s no-frame inactivity heuristic (no real "playback ended" signal exists on the adapter interface) \'97 tunable later without touching the interface.\
+- The stdin backpressure queue needs a concrete bound (frame count/byte cap); a reasonable default will be picked during implementation.\
+- Uniview's ~12.5fps export cap is a known v1 limitation; removing it is a separate, riskier native-addon change if wanted later.}
