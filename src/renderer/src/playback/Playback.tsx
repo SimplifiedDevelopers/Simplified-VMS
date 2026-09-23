@@ -4,21 +4,14 @@ import { VideoCanvas } from '../liveView/VideoCanvas';
 import { DigitalZoomLayer } from '../liveView/DigitalZoom';
 import { TileContextMenu } from '../liveView/TileContextMenu';
 import { MiniCalendar } from './MiniCalendar';
-import { Modal } from '../components/Modal';
 import { CameraOffIcon } from '../components/icons';
 import { PauseIcon, PlayIcon, ScissorsIcon, StepForwardIcon, StopIcon } from './icons';
-import {
-  Centered,
-  Legend,
-  popupInputStyle,
-  searchButtonStyle,
-  secondaryButtonStyle,
-  ToolbarIconButton,
-  TransportButton,
-  ZoomButton,
-} from './PlaybackControls';
+import { Centered, Legend, ToolbarIconButton, TransportButton, ZoomButton } from './PlaybackControls';
 import { PlaybackSidebar } from './PlaybackSidebar';
 import { RecordingFilesPanel } from './RecordingFilesPanel';
+import { ExportPopup } from './ExportPopup';
+import { SearchByTimePopup } from './SearchByTimePopup';
+import { DownloadsPopup } from './DownloadsPopup';
 import {
   DAY_MS,
   emptyTile,
@@ -1513,178 +1506,38 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
       />
 
       {exportPopup && (
-        <Modal width={380} onDismiss={handleCancelExport}>
-          <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
-            <div style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Export Recording</div>
-            <div style={{ fontSize: '12px', color: theme.textMuted }}>
-              {formatTime(exportPopup.startMs)} — {formatTime(exportPopup.endMs)}
-            </div>
-
-            <button onClick={handleChooseExportPath} disabled={exportPopup.choosing} style={secondaryButtonStyle}>
-              {exportPopup.choosing ? 'Choosing…' : exportPopup.path ? 'Change Destination…' : 'Choose Destination…'}
-            </button>
-            {exportPopup.path && (
-              <div style={{ fontSize: '11px', color: theme.textFaint, wordBreak: 'break-all' }}>{exportPopup.path}</div>
-            )}
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button onClick={handleCancelExport} style={secondaryButtonStyle}>
-                Cancel
-              </button>
-              <button
-                onClick={handleStartExportDownload}
-                disabled={!exportPopup.path}
-                style={{ ...searchButtonStyle, opacity: exportPopup.path ? 1 : 0.5, cursor: exportPopup.path ? 'pointer' : 'not-allowed' }}
-              >
-                Download
-              </button>
-            </div>
-          </div>
-        </Modal>
+        <ExportPopup
+          exportPopup={exportPopup}
+          onChooseExportPath={handleChooseExportPath}
+          onCancel={handleCancelExport}
+          onStartDownload={handleStartExportDownload}
+        />
       )}
 
       {searchByTimeOpen && (
-        <Modal width={320} onDismiss={() => setSearchByTimeOpen(false)}>
-          <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
-            <div style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Search by Time</div>
-            <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
-              <span style={{ fontSize: '11.5px', color: theme.textMuted }}>Date</span>
-              <input
-                type="date"
-                value={searchByTimeDate}
-                onChange={(e) => setSearchByTimeDate(e.target.value)}
-                style={popupInputStyle}
-              />
-            </label>
-            <div style={{ display: 'flex', gap: '0.6rem' }}>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: 1 }}>
-                <span style={{ fontSize: '11.5px', color: theme.textMuted }}>Start Time</span>
-                <input
-                  type="time"
-                  value={searchByTimeStart}
-                  onChange={(e) => setSearchByTimeStart(e.target.value)}
-                  style={popupInputStyle}
-                />
-              </label>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: 1 }}>
-                <span style={{ fontSize: '11.5px', color: theme.textMuted }}>End Time</span>
-                <input
-                  type="time"
-                  value={searchByTimeEnd}
-                  onChange={(e) => setSearchByTimeEnd(e.target.value)}
-                  style={popupInputStyle}
-                />
-              </label>
-            </div>
-            {searchByTimeInvalid && (
-              <span style={{ fontSize: '11px', color: theme.danger }}>End time must be after start time.</span>
-            )}
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button onClick={() => setSearchByTimeOpen(false)} style={secondaryButtonStyle}>
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmSearchByTime}
-                disabled={searchByTimeInvalid}
-                style={{
-                  ...searchButtonStyle,
-                  opacity: searchByTimeInvalid ? 0.5 : 1,
-                  cursor: searchByTimeInvalid ? 'not-allowed' : 'pointer',
-                }}
-              >
-                Search
-              </button>
-            </div>
-          </div>
-        </Modal>
+        <SearchByTimePopup
+          date={searchByTimeDate}
+          onDateChange={setSearchByTimeDate}
+          startTime={searchByTimeStart}
+          onStartTimeChange={setSearchByTimeStart}
+          endTime={searchByTimeEnd}
+          onEndTimeChange={setSearchByTimeEnd}
+          invalid={searchByTimeInvalid}
+          onCancel={() => setSearchByTimeOpen(false)}
+          onConfirm={handleConfirmSearchByTime}
+        />
       )}
 
       {downloadsPopupOpen && (
-        <Modal width={420} onDismiss={() => setDownloadsPopupOpen(false)}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              padding: '1rem 1.25rem',
-              borderBottom: `1px solid ${theme.border}`,
-            }}
-          >
-            <span style={{ fontSize: '14px', fontWeight: 600, color: theme.text }}>Downloads</span>
-            <button
-              onClick={() => setDownloadsPopupOpen(false)}
-              style={{ background: 'none', border: 'none', color: theme.textMuted, fontSize: '16px', cursor: 'pointer' }}
-            >
-              &times;
-            </button>
-          </div>
-          <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-            {downloads.length === 0 && (
-              <div style={{ fontSize: '12px', color: theme.textFaint }}>No downloads.</div>
-            )}
-            {downloads.map((d) => (
-              <div
-                key={d.handle}
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '0.4rem',
-                  padding: '0.6rem',
-                  borderRadius: '5px',
-                  border: `1px solid ${theme.border}`,
-                }}
-              >
-                <div style={{ fontSize: '12.5px', color: theme.text, fontWeight: 600 }}>
-                  {d.deviceName} · {d.channelLabel}
-                </div>
-                <div style={{ fontSize: '11px', color: theme.textFaint, wordBreak: 'break-all' }}>{d.path}</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <div style={{ flex: 1, height: '6px', borderRadius: '3px', background: theme.border, overflow: 'hidden' }}>
-                    <div
-                      style={{
-                        width: `${d.progress}%`,
-                        height: '100%',
-                        background: d.error ? theme.danger : d.done ? theme.success : d.paused ? theme.warning : theme.accent,
-                        transition: 'width 0.2s',
-                      }}
-                    />
-                  </div>
-                  <span style={{ fontSize: '11px', color: theme.textMuted, width: '32px', textAlign: 'right' }}>
-                    {Math.round(d.progress)}%
-                  </span>
-                </div>
-                {d.paused && !d.error && (
-                  <div style={{ fontSize: '11px', color: theme.warning }}>Paused</div>
-                )}
-                {d.error && <div style={{ fontSize: '11px', color: theme.danger }}>{d.error}</div>}
-                <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <button onClick={() => handleOpenDownloadLocation(d.path)} style={secondaryButtonStyle}>
-                    Open
-                  </button>
-                  {d.done ? (
-                    <button onClick={() => handleDismissDownload(d.handle)} style={secondaryButtonStyle}>
-                      Dismiss
-                    </button>
-                  ) : (
-                    <>
-                      {d.paused ? (
-                        <button onClick={() => handleResumeDownload(d.handle)} style={secondaryButtonStyle}>
-                          Resume
-                        </button>
-                      ) : (
-                        <button onClick={() => handlePauseDownload(d.handle)} style={secondaryButtonStyle}>
-                          Pause
-                        </button>
-                      )}
-                      <button onClick={() => handleStopDownload(d.handle)} style={secondaryButtonStyle}>
-                        Cancel
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </Modal>
+        <DownloadsPopup
+          downloads={downloads}
+          onClose={() => setDownloadsPopupOpen(false)}
+          onOpenLocation={handleOpenDownloadLocation}
+          onDismiss={handleDismissDownload}
+          onPause={handlePauseDownload}
+          onResume={handleResumeDownload}
+          onStop={handleStopDownload}
+        />
       )}
 
       {contextMenu && (
