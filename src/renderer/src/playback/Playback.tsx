@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
 import { theme } from '../theme';
 import { VideoCanvas } from '../liveView/VideoCanvas';
 import { DigitalZoomLayer } from '../liveView/DigitalZoom';
@@ -6,6 +6,35 @@ import { TileContextMenu } from '../liveView/TileContextMenu';
 import { MiniCalendar } from './MiniCalendar';
 import { Modal } from '../components/Modal';
 import { CameraOffIcon, PanelChevronIcon } from '../components/icons';
+import { DownloadIcon, PauseIcon, PlayIcon, ScissorsIcon, StepForwardIcon, StopIcon } from './icons';
+import {
+  Centered,
+  Legend,
+  popupInputStyle,
+  searchButtonStyle,
+  secondaryButtonStyle,
+  ToolbarIconButton,
+  TransportButton,
+  ZoomButton,
+} from './PlaybackControls';
+import {
+  DAY_MS,
+  emptyTile,
+  FILTER_OPTIONS,
+  formatTime,
+  LAYOUTS,
+  MAX_TILES,
+  resourceLevelColor,
+  statusColor,
+  statusLabel,
+  TYPE_COLOR,
+  ZOOM_LEVELS,
+  zoomLabel,
+  type ClipMark,
+  type DownloadItem,
+  type ExportPopupState,
+  type PlaybackTileState,
+} from './playbackModel';
 import emptyTileCamera from '../assets/empty-tile-camera.png';
 import type {
   ChannelInfo,
@@ -13,154 +42,9 @@ import type {
   PlaybackSpeed,
   RecordingSearchFilter,
   RecordingSegment,
-  RecordingType,
   StoredDevice,
   SystemStats,
 } from '../../../shared/types';
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-const LAYOUTS = [1, 4, 9] as const;
-const MAX_TILES = 9;
-// Zooming widens the timeline's rendered width (see the zoom control near
-// the legend) rather than narrowing the time range it shows — at 1x, a
-// short motion clip a few seconds long can be a couple of pixels wide and
-// nearly impossible to click precisely; at 16x it's ~16x wider on screen
-// for the same click precision, with the container scrolling horizontally.
-const ZOOM_LEVELS = [1, 2, 4, 8, 16] as const;
-
-const TYPE_COLOR: Record<RecordingType, string> = {
-  continuous: theme.accent,
-  motion: theme.warning,
-  smart: theme.danger,
-  other: theme.textFaint,
-};
-
-const FILTER_OPTIONS: { value: RecordingSearchFilter; label: string }[] = [
-  { value: 'all', label: 'All' },
-  { value: 'continuous', label: 'Continuous' },
-  { value: 'motion', label: 'Motion' },
-  { value: 'smart', label: 'Smart' },
-];
-
-function formatTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function resourceLevelColor(percent: number): string {
-  if (percent >= 85) return theme.danger;
-  if (percent >= 60) return theme.warning;
-  return theme.success;
-}
-
-function statusColor(status: DeviceConnectionStatus | undefined): string {
-  if (!status || status.state === 'connecting') return theme.warning;
-  return status.state === 'online' ? theme.success : theme.danger;
-}
-
-function statusLabel(status: DeviceConnectionStatus | undefined): string {
-  if (!status || status.state === 'connecting') return 'Connecting…';
-  return status.state === 'online' ? 'Online' : `Offline — ${status.error}`;
-}
-
-// Shows the visible time span at this zoom level (24h / zoom) rather than
-// a bare multiplier — "3hrs" tells you directly what you're looking at,
-// where "8x" would need mental math every time.
-function zoomLabel(zoom: number): string {
-  const hours = 24 / zoom;
-  const rounded = Number.isInteger(hours) ? hours.toString() : hours.toFixed(1);
-  return `${rounded}hr${hours === 1 ? '' : 's'}`;
-}
-
-interface PlaybackTileState {
-  deviceId: string | null;
-  deviceName: string | null;
-  channel: number | null;
-  channelLabel: string | null;
-  segments: RecordingSegment[];
-  searching: boolean;
-  viewHandle: string | null;
-  isPaused: boolean;
-  currentMs: number | null;
-  // The [start, end] range viewHandle was actually opened with — a seek is
-  // only valid within this exact range (confirmed live: seeking a
-  // different recording's time range failed with NETDEV_E_PLAYER_INVALID_
-  // PARAM, and left the tile stuck retrying the same broken seek forever
-  // until this range check was added).
-  playStartMs: number | null;
-  playEndMs: number | null;
-  error: string | null;
-  // Set by handleStopAll right before it clears currentMs/playEndMs below
-  // - lets the Resume button (next to Stop) restart playback from the
-  // exact point it was stopped at, instead of the user needing to re-find
-  // and re-click that spot on the timeline. null whenever there's nothing
-  // to resume (never played, or already resumed/replaced by a new
-  // segment - both paths reset the tile via emptyTile()).
-  stoppedAtMs: number | null;
-  stoppedEndMs: number | null;
-}
-
-function emptyTile(): PlaybackTileState {
-  return {
-    deviceId: null,
-    deviceName: null,
-    channel: null,
-    channelLabel: null,
-    segments: [],
-    searching: false,
-    viewHandle: null,
-    isPaused: false,
-    currentMs: null,
-    playStartMs: null,
-    playEndMs: null,
-    error: null,
-    stoppedAtMs: null,
-    stoppedEndMs: null,
-  };
-}
-
-interface ClipMark {
-  deviceId: string;
-  channel: number;
-  startMs: number;
-}
-
-interface ExportPopupState {
-  deviceId: string;
-  deviceName: string;
-  channel: number;
-  channelLabel: string;
-  startMs: number;
-  endMs: number;
-  path: string | null;
-  choosing: boolean;
-}
-
-// A clip download that's been started — tracked independently of
-// ExportPopupState so the export popup can close the instant "Download" is
-// clicked (per explicit request: downloads run in the background, not
-// blocking the popup) while progress keeps updating here. Surfaced via a
-// small indicator next to the clip-marker buttons; clicking it opens the
-// Downloads popup listing every item below.
-interface DownloadItem {
-  handle: string;
-  deviceId: string;
-  deviceName: string;
-  channel: number;
-  channelLabel: string;
-  path: string;
-  progress: number;
-  done: boolean;
-  // User-paused via the Downloads popup's own Pause button — distinct from
-  // done/error, and from a tile's on-screen setFrameDelivery pause (that's
-  // about not rendering a preview nobody's looking at; this actually stops
-  // and later resumes the export's own native session).
-  paused: boolean;
-  // Set once the file's actually been checked on disk after reaching
-  // 100% — a vendor reporting "done" doesn't necessarily mean the
-  // transfer genuinely succeeded (confirmed live on TVT: a failed
-  // transfer still reports 100%, producing a 0-byte "successful" export).
-  error?: string;
-}
 
 // isActive defaults to true so a popped-out window (PopoutWindow.tsx,
 // always its own visible OS window — no tab-hiding concept applies there)
@@ -2222,253 +2106,3 @@ export function Playback({ isActive = true }: { isActive?: boolean } = {}) {
     );
   }
 }
-
-function Centered({ children }: { children: ReactNode }) {
-  return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      {children}
-    </div>
-  );
-}
-
-function Legend({ color, label }: { color: string; label: string }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-      <span style={{ width: '7px', height: '7px', borderRadius: '2px', background: color }} />
-      {label}
-    </div>
-  );
-}
-
-function ZoomButton({ disabled, onClick, children }: { disabled?: boolean; onClick?: () => void; children: ReactNode }) {
-  return (
-    <button
-      disabled={disabled}
-      onClick={onClick}
-      style={{
-        width: '16px',
-        height: '16px',
-        borderRadius: '3px',
-        border: `1px solid ${theme.border}`,
-        background: 'transparent',
-        color: disabled ? theme.textFaint : theme.textMuted,
-        fontSize: '11px',
-        lineHeight: 1,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        cursor: disabled ? 'default' : 'pointer',
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-// Plain vector icons (fill=currentColor), not the Unicode media-control
-// glyphs (⏸⏭⏹) they replace — Windows renders those specific codepoints via
-// its color-emoji font, which looks visibly different in weight/style from
-// Speed's plain text and Sync's plain arrow glyph, even once the buttons
-// themselves share identical styling. Same fix already applied once to the
-// header icons (see shell/icons.tsx) for the same underlying reason.
-function PlayIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M6 4l14 8-14 8V4z" />
-    </svg>
-  );
-}
-
-function PauseIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <rect x="5" y="4" width="5" height="16" />
-      <rect x="14" y="4" width="5" height="16" />
-    </svg>
-  );
-}
-
-function StopIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <rect x="5" y="5" width="14" height="14" />
-    </svg>
-  );
-}
-
-function StepForwardIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M4 5l11 7-11 7V5z" />
-      <rect x="17" y="5" width="3" height="14" />
-    </svg>
-  );
-}
-
-// Scissors — shared by both clip-marker buttons (mark start/end point to
-// download), a more immediately recognizable "cut point" symbol than the
-// bracket shapes this replaced. Stroke-based (not filled) since scissors
-// read much more clearly as an outline than as a solid silhouette at this
-// size.
-function ScissorsIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="6" cy="6" r="3" />
-      <circle cx="6" cy="18" r="3" />
-      <line x1="20" y1="4" x2="8.12" y2="15.88" />
-      <line x1="14.47" y1="14.48" x2="20" y2="20" />
-      <line x1="8.12" y1="8.12" x2="12" y2="12" />
-    </svg>
-  );
-}
-
-// Right-panel file-list entries' per-item download button.
-function DownloadIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 3v12" />
-      <path d="M7 10l5 5 5-5" />
-      <path d="M5 21h14" />
-    </svg>
-  );
-}
-
-function ToolbarIconButton({
-  title,
-  disabled,
-  danger,
-  onClick,
-  children,
-}: {
-  title: string;
-  disabled?: boolean;
-  danger?: boolean;
-  onClick?: () => void;
-  children: ReactNode;
-}) {
-  const restColor = disabled ? theme.textFaint : danger ? theme.danger : theme.textMuted;
-  const hoverColor = danger ? theme.danger : theme.text;
-  const style: CSSProperties = {
-    minWidth: '26px',
-    height: '26px',
-    padding: '0 0.35rem',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: '4px',
-    border: 'none',
-    background: 'none',
-    color: restColor,
-    fontSize: '13px',
-    fontWeight: danger ? 700 : 400,
-    cursor: disabled ? 'default' : 'pointer',
-    opacity: disabled ? 0.5 : 1,
-  };
-  return (
-    <button
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-      style={style}
-      onMouseEnter={(e) => {
-        if (!disabled) e.currentTarget.style.color = hoverColor;
-      }}
-      onMouseLeave={(e) => {
-        if (!disabled) e.currentTarget.style.color = restColor;
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-// Deliberately larger and filled (not the small flat ToolbarIconButton
-// style) — this is the main playback control cluster (play/pause,
-// frame-step, stop, speed, sync, clip markers), and needs to visually read
-// as "the main controls" at a glance rather than blend in with the smaller
-// utility icons (layout/close-all/CPU-mem) around it. `primary` gives
-// play/pause an accent fill so it's the first thing the eye lands on,
-// matching how most media players treat their play button.
-function TransportButton({
-  title,
-  disabled,
-  primary,
-  onClick,
-  children,
-}: {
-  title: string;
-  disabled?: boolean;
-  primary?: boolean;
-  onClick?: () => void;
-  children: ReactNode;
-}) {
-  const style: CSSProperties = {
-    minWidth: '40px',
-    height: '40px',
-    padding: '0 0.5rem',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: '8px',
-    border: primary ? 'none' : `1px solid ${theme.border}`,
-    background: disabled ? theme.surface : primary ? theme.accent : theme.surface,
-    color: disabled ? theme.textFaint : primary ? theme.accentText : theme.text,
-    fontSize: '16px',
-    fontWeight: 600,
-    cursor: disabled ? 'default' : 'pointer',
-    opacity: disabled ? 0.5 : 1,
-    flexShrink: 0,
-    transition: 'background 100ms ease',
-  };
-  return (
-    <button
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-      style={style}
-      onMouseEnter={(e) => {
-        if (disabled) return;
-        e.currentTarget.style.background = primary ? theme.accentHover : theme.surfaceHover;
-      }}
-      onMouseLeave={(e) => {
-        if (disabled) return;
-        e.currentTarget.style.background = primary ? theme.accent : theme.surface;
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-const searchButtonStyle = {
-  padding: '0.5rem',
-  borderRadius: '5px',
-  border: 'none',
-  background: theme.accent,
-  color: theme.accentText,
-  fontSize: '12.5px',
-  fontWeight: 600,
-  cursor: 'pointer',
-};
-
-const secondaryButtonStyle: CSSProperties = {
-  padding: '0.5rem',
-  borderRadius: '5px',
-  border: `1px solid ${theme.borderLight}`,
-  background: 'transparent',
-  color: theme.text,
-  fontSize: '12.5px',
-  cursor: 'pointer',
-  flex: 1,
-};
-
-const popupInputStyle: CSSProperties = {
-  padding: '0.5rem 0.6rem',
-  borderRadius: '5px',
-  border: `1px solid ${theme.border}`,
-  background: theme.surface,
-  color: theme.text,
-  fontSize: '13px',
-  outline: 'none',
-};
