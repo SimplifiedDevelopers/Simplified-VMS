@@ -203,11 +203,21 @@ function handleFrame(handle: string, job: ExportJob, frame: DecodedFrame): void 
       // libx264's default preset ('medium') was confirmed live to sustain
       // 55-96% CPU across all 4 vendors during an export, not just Dahua —
       // 'medium' spends real CPU searching for smaller output at a fixed
-      // quality; 'veryfast' trades some of that compression efficiency
-      // (a somewhat larger file) for dramatically less per-frame encode
-      // work, which is the right trade for an evidence-clip export where
-      // the recording itself is already lossy-compressed by the camera.
-      '-preset', 'veryfast',
+      // quality. Moved to 'veryfast' first (real, substantial CPU cut),
+      // then to 'ultrafast' after a user report that exports still ran far
+      // slower than the manufacturer's own VMS software — its export is a
+      // raw stream copy of the already-compressed recording (no decode, no
+      // re-encode), which this pipeline can't match no matter the preset
+      // since it decodes every frame and re-encodes in real time by design
+      // (built this way because each vendor's own native backup/export SDK
+      // call was unreliable, producing 0-byte files - see clipExporter.ts's
+      // module doc comment). 'ultrafast' is the fastest libx264 preset,
+      // trading further compression efficiency (a larger file than
+      // 'veryfast' produced) for the least possible per-frame encode work -
+      // the right trade here since an evidence clip's source is already
+      // lossy-compressed by the camera, so a bigger but still-lossy output
+      // costs little.
+      '-preset', 'ultrafast',
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart',
       '-loglevel', 'error',
