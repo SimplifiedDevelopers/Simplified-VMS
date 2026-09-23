@@ -3,17 +3,22 @@ import { dirname, join } from 'path';
 import { app } from 'electron';
 import type { AppSettings } from '../../shared/types';
 
-// The installed app's own folder (the directory containing the .exe) —
-// deliberately NOT app.getAppPath()/process.resourcesPath, which point
-// inside resources/app.asar. In dev mode app.getPath('exe') resolves to
-// node_modules/electron/dist, which isn't a sensible place to create
-// user-facing folders, so dev falls back to the project root instead.
-function installDir(): string {
-  return app.isPackaged ? dirname(app.getPath('exe')) : process.cwd();
-}
-
+// Previously rooted at the installed app's own folder (dirname of the
+// .exe) - confirmed live as a real bug: a per-machine install lands in
+// Program Files, which a standard (non-admin) user has no write access to
+// at all. The very first launch after any fresh install/update tried to
+// mkdirSync these folders there, threw an unhandled EPERM before the
+// window was ever created (no crash, no window, nothing in Event Viewer -
+// a clean JS-level failure with no attached console to show it), and
+// silently killed startup. Running once as Administrator created the
+// folders, after which every future launch found them already there and
+// never touched Program Files again - explains exactly why only the
+// first run after an install/update ever needed elevation. Documents is
+// always writable by the current user without elevation, and is a more
+// discoverable place for staff to find their own snapshots/recordings
+// anyway than digging into the app's own Program Files install folder.
 function defaultMediaPath(subfolder: string): string {
-  return join(installDir(), 'Media', subfolder);
+  return join(app.getPath('documents'), 'Simplified VMS', subfolder);
 }
 
 // A function (not a static object) since it calls Electron path APIs —
@@ -37,17 +42,27 @@ function getDefaults(): AppSettings {
   };
 }
 
-// Physically creates Media/Snapshot, Media/Local Recording, and
-// Media/Video Backup next to the installed app so they exist right away
-// rather than only appearing the first time each feature actually saves
-// something — called once at startup (see main/index.ts). Snapshot/
-// Recording/Export already mkdirSync(..., {recursive:true}) their target
-// folder on every save regardless, so this is a head start, not something
-// those features depend on.
+// Physically creates Snapshot/Video Backup/Local Recording under
+// Documents/Simplified VMS so they exist right away rather than only
+// appearing the first time each feature actually saves something — called
+// once at startup (see main/index.ts). Snapshot/Recording/Export already
+// mkdirSync(..., {recursive:true}) their target folder on every save
+// regardless, so this is only ever a head start, never something those
+// features depend on - each folder is created independently and a
+// failure here is swallowed rather than thrown, so a bad path (this
+// used to default inside Program Files, unwritable without admin - see
+// defaultMediaPath's doc comment - or a user-customized path on a
+// removable/network drive that isn't currently available) can never again
+// silently kill the rest of startup before the window is even created,
+// the way it did before this was caught.
 export function ensureDefaultMediaFolders(): void {
   const defaults = getDefaults();
   for (const p of [defaults.snapshotPath, defaults.exportPath, defaults.localRecordingPath]) {
-    mkdirSync(p, { recursive: true });
+    try {
+      mkdirSync(p, { recursive: true });
+    } catch {
+      // Best-effort only - see doc comment above.
+    }
   }
 }
 
